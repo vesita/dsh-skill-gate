@@ -114,6 +114,28 @@ console.log('# 2. 只读不误伤')
     h.guard({ name: 'bash', agent: B, arguments: { command: 'head -5 f 2>&1' } }) === undefined,
     '2. 2>&1 重定向不算写',
   )
+  // 空汇重定向：`>/dev/null` 不改变状态，别当成写（否则纯读取的命令被拦，正是门禁自己的承诺）
+  ok(
+    h.guard({ name: 'bash', agent: B, arguments: { command: 'dsh --profile web --dump-config >/dev/null 2>&1' } }) ===
+      undefined,
+    '2. >/dev/null 不算写',
+  )
+  ok(
+    h.guard({ name: 'bash', agent: B, arguments: { command: 'grep -n x f 2>/dev/null' } }) === undefined,
+    '2. 2>/dev/null 不算写',
+  )
+  ok(
+    h.guard({ name: 'bash', agent: B, arguments: { command: 'cmd &>/dev/null' } }) === undefined,
+    '2. &>/dev/null 不算写',
+  )
+  ok(
+    typeof h.guard({ name: 'bash', agent: B, arguments: { command: 'cmd >> out.txt' } }) === 'string',
+    '2. 写真实文件仍拦',
+  )
+  ok(
+    typeof h.guard({ name: 'bash', agent: B, arguments: { command: 'cmd >/dev/null; rm -rf /tmp/x' } }) === 'string',
+    '2. /dev/null 后面还有写操作，整体仍拦',
+  )
   ok(h.guard({ name: 'write', arguments: {} }) === undefined, '2. 无 agent 身份不拦')
 }
 

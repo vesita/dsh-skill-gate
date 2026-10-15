@@ -65,11 +65,18 @@ const turnOf = new Map()
 /** agentId -> 本轮的 catalog 名字集合；null = 取不到 catalog（按严格处理）。 */
 const catalogOf = new Map()
 
+/**
+ * `>/dev/null` 是空汇：它不改变任何状态。判定前先把它当作空白抹掉，
+ * 否则 `cmd 2>/dev/null`、`dsh --dump-config >/dev/null` 这类纯读取会被当成写操作拦住。
+ */
+const NULL_SINK = /(^|[^<])(?:\d?|&)>{1,2}\s*\/dev\/null\b/g
+
 function isGuarded(exec) {
   if (GUARDED_TOOLS.has(exec.name)) return true
   if (exec.name !== 'bash') return false
   const command = exec.arguments?.command
-  return typeof command === 'string' && BASH_WRITE_SIGNAL.test(command)
+  if (typeof command !== 'string') return false
+  return BASH_WRITE_SIGNAL.test(command.replace(NULL_SINK, ' '))
 }
 
 /** 配置里可能存着一个 volatile 引用（`{ get() }`），也可能就是普通数组。 */

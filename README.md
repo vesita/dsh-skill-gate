@@ -56,14 +56,14 @@ dsh plugin --profile <profile> add dsh-skill-gate
 - **粒度是一轮**：判定在 `agent/pre-step` 换 turn 时清空，每个 turn 重新要求一次。
 - **只认成功的原生加载**：`tools/result` 里工具名是 `skill`、且 `isError` 为假才算数；失败的加载不算，加载别的工具也不算。
 - **受保护的工具**：`write`、`edit`、`plugin_manager`，以及会改状态的 bash 命令（输出重定向、`tee` / `rm` / `mv` / `cp` / `mkdir` / `touch` / `dd` / `chmod` / `chown` / `ln`、`sed -i`、`git commit|push|reset|...`、包管理器的安装类子命令、`sudo`）。
-- **只读不拦**：`read` / `grep` / `glob` / `skill` 等只读工具，以及纯读的 bash（含 `2>&1` 这种读侧重定向）一律放行；没有会话身份的调用不拦。
+- **只读不拦**：`read` / `grep` / `glob` / `skill` 等只读工具，以及纯读的 bash（含 `2>&1`，以及 `>/dev/null` / `2>/dev/null` / `&>/dev/null` 这类空汇重定向）一律放行；没有会话身份的调用不拦。
 - **反死锁**：`requiredSkills` 里写了当前 catalog 里不存在的名字（skill 改名或删除）时，这个名字本轮被忽略并记一行 warning；取不到 catalog（`skills` 服务缺席或调用失败）时保持严格，按原名单要求。
 
 ## 已知边界
 
 - 门禁只能证明**加载动作发生过**，证明不了模型真的读了正文 —— 这是提示词之外唯一能机械判定的东西。
 - catalog 软化是 best-effort：它按当前 workspace 的 skill 视图判断；缓存过期时可能多拦或少拦一次。
-- bash 判定基于命令文本的正则，没有 shell 解析器：它只拦明确会写的命令，读命令一律放行。
+- bash 判定基于命令文本的正则，没有 shell 解析器：它只拦明确会写的命令，读命令一律放行；重定向到 `/dev/null` 先按空白抹掉再判，所以 `cmd >/dev/null` 不会被误拦，而同一条命令里还有别的写操作时照样拦。
 - 判定状态在进程内，按会话 id 记录；进程重启即清空。
 
 ## License
