@@ -38,6 +38,8 @@
     const NS = 'skill-gate'
     /** 本卡片编辑的唯一字段；名字必须与宿主半边 schema 逐字一致（已持久化的值不能改名）。 */
     const FIELD = 'requiredSkills'
+    /** 第二个字段：会话里那条可见说明的开关（`marker` / `off`），同样逐字对应宿主 schema。 */
+    const ANNOUNCE_FIELD = 'announce'
     /** 组合包配置区的 key：必须是**包名**（= package.json 的 name）。 */
     const BUNDLE_KEY = 'dsh-skill-gate'
     /** 行配置区的 key：`<包名>#<patch 里声明的行 id>`。 */
@@ -160,6 +162,16 @@
     }
 
     /**
+     * `announce` 的转换 spec：存的是 `string`，草稿就是 `'marker' | 'off'`。
+     * 认不出的取值一律按默认的 `marker` 显示；草稿不是 `off` 就走 `clear`（清掉用户层 = 回 schema 默认）。
+     */
+    const announceField = {
+      field: ANNOUNCE_FIELD,
+      format: (value: any) => (value === 'off' ? 'off' : 'marker'),
+      parse: (text: string) => (text === 'off' ? { kind: 'set', value: 'off' } : { kind: 'clear' })
+    }
+
+    /**
      * 依赖的客户端服务：槽位注册表 + 配置表单（`configForms`，由 dsh-client-ui-settings 提供）。
      * 服务名在这里 inject，不写进 `dsh.client.inject`（那一层是部署侧的声明）。
      */
@@ -173,13 +185,14 @@
       // `configForms.get(entryId)` 用的 entryId 是本插件在 profile 里的条目 id，
       // 与宿主半边 Config 的命名空间同一个值。
       const scope = ctx.configForms.get(NS)
-      const formModel = new SettingsFormModel(scope, [requiredSkillsField])
+      const formModel = new SettingsFormModel(scope, [requiredSkillsField, announceField])
       ctx.effect(() => () => { formModel.dispose() })
 
       /** 表单投影：`shell` 是保存栏状态，字段本身是一份读数（text / overridden / invalid）。 */
       const formStore = formModel.bind(() => ({
         shell: formModel.shell(),
-        [FIELD]: formModel.field(FIELD)
+        [FIELD]: formModel.field(FIELD),
+        [ANNOUNCE_FIELD]: formModel.field(ANNOUNCE_FIELD)
       }))
       ctx.effect(() => () => { formStore.dispose() })
 
@@ -326,6 +339,28 @@
           ? '当前一个都没勾：名单为空，不生效（这是刻意的：没配名单就不加载）。'
           : '已勾选 ' + selected.length + ' 份：' + selected.join('、')
 
+        /**
+         * 可见说明的开关。勾选态**派生**自 `announce` 字段的草稿文本（与名单同一套做法：
+         * 点一下 = `props.edit(字段, 新文本)`，保存/丢弃仍归官方表单）。
+         */
+        const announceOn = String(state[ANNOUNCE_FIELD] ? state[ANNOUNCE_FIELD].text : 'marker') !== 'off'
+        const announceRow = () => h(
+          'label',
+          { style: styles.row, key: 'announce' },
+          h('input', {
+            type: 'checkbox',
+            style: styles.checkbox,
+            checked: announceOn,
+            disabled: locked,
+            onChange: () => { props.edit(ANNOUNCE_FIELD, announceOn ? 'off' : 'marker') }
+          }),
+          h('span', { style: styles.col },
+            h('span', { style: styles.label }, '在对话里留一条自动加载说明'),
+            h('span', { style: styles.desc },
+              '默认勾选：会话开始自动加载后，对话里出现一行短说明（点名加载了哪几份、说明是机制触发）。' +
+              '取消勾选：不产生这一行；正文照旧注入，加载不齐时仍会出声。'))
+        )
+
         /** 降级路径：路由不可用时回到上一版的「一行一个名字」。 */
         const fallbackEditor = () => h(
           'div',
@@ -343,7 +378,8 @@
             placeholder: 'your-required-skill',
             value: field.text,
             onChange: (event: any) => { props.edit(FIELD, event.target.value) }
-          })
+          }),
+          announceRow()
         )
 
         /** 勾选列表：catalog 组 + 「已配置但不在 catalog」组。 */
@@ -417,7 +453,8 @@
               h('span', { style: styles.col }, h('span', { style: styles.skillNameWarn }, name))
             ))
           ),
-          h('p', { style: styles.hint, role: 'status' }, selectionLine)
+          h('p', { style: styles.hint, role: 'status' }, selectionLine),
+          h('div', { style: styles.group }, announceRow())
         )
 
         return h(

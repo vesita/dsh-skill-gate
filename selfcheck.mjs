@@ -104,6 +104,9 @@ const O = { id: 'agent-O' }
 const P = { id: 'agent-P' }
 const Q = { id: 'agent-Q' }
 const R = { id: 'agent-R' }
+const S = { id: 'agent-S' }
+const T = { id: 'agent-T' }
+const U = { id: 'agent-U' }
 
 const allCtxs = []
 function ctxOf(opts) {
@@ -131,7 +134,7 @@ console.log('# 1. 默认（requiredSkills: []）：什么都不做 —— 没配
   ok(h.infos.length === 0, '1. 空名单：不记自动加载日志')
 }
 
-console.log('# 2. 首次 agent/pre-step：名单里 catalog 有的逐个**真执行**一次加载，正文进本步消息')
+console.log('# 2. 首次 agent/pre-step：逐个**真执行**一次加载 + 一条可见说明 + 正文进本步消息')
 {
   const h = ctxOf({ config: { requiredSkills: ['a', 'b'] }, services: { skills: catalog('a', 'b') } })
   const decision = await h.step(B, 1)
@@ -140,11 +143,20 @@ console.log('# 2. 首次 agent/pre-step：名单里 catalog 有的逐个**真执
   ok(h.executed.every((e) => typeof e.callId === 'string' && e.callId.startsWith('skill-autoload:')),
     '2. callId 带可区分的 skill-autoload: 前缀')
   ok(h.executed.map((e) => e.arguments.name).join(',') === 'a,b', '2. 逐个按名单顺序执行')
-  ok(decision.kind === 'enter' && decision.messages.length === 2, '2. 本步消息里多出 2 条注入')
-  ok(decision.messages.every((m) => m.role === 'user' && m.source.kind === 'skill-autoload'),
-    "2. 注入消息 role=user 且 source.kind='skill-autoload'")
-  ok(decision.messages.map((m) => m.source.name).join(',') === 'a,b', '2. 每条注入点名它加载的 skill')
-  ok(decision.messages[0].content[0].text.includes('<skill_content name="a">'), '2. 注入的是工具执行返回的正文')
+
+  const markers = decision.messages.filter((m) => m.source.form === 'notice')
+  const bodies = decision.messages.filter((m) => m.source.form === 'instructions')
+  ok(decision.kind === 'enter' && decision.messages.length === 3, '2. 本步消息 = 1 条说明 + 2 条正文')
+  ok(markers.length === 1, '2. 可见说明**恰好一条**（这就是对话里能看见的那一行）')
+  ok(decision.messages[0] === markers[0], '2. 说明排在正文之前（先看到发生了什么）')
+  ok(markers[0].content[0].text.includes('已加载 a、b'), '2. 说明点名这次自动加载了哪几份')
+  ok(markers[0].content[0].text.includes('机制触发'), '2. 说明点明是机制触发、不是模型调用')
+  ok(typeof markers[0].source.summary === 'string' && markers[0].source.summary.length <= 120,
+    '2. 说明带 ≤120 字的 summary（客户端按 form=notice 呈现）')
+  ok(bodies.length === 2 && bodies.every((m) => m.role === 'user' && m.source.kind === 'skill-autoload'),
+    "2. 正文 role=user 且 source.kind='skill-autoload'")
+  ok(bodies.map((m) => m.source.name).join(',') === 'a,b', '2. 每条正文点名它加载的 skill')
+  ok(bodies[0].content[0].text.includes('<skill_content name="a">'), '2. 注入的是工具执行返回的正文')
   ok(h.infos.length === 1 && h.infos[0].includes('已加载 a、b'), '2. 只读观测汇总成一行 info 日志')
 }
 
@@ -165,7 +177,8 @@ console.log('# 4. 名单里 catalog 没有的名字：不执行它 + 说明行�
   ok(h.warnings.some((w) => w.includes('b')), '4. 不在 catalog 的 b 记一行 warning')
   const note = decision.messages.find((m) => m.source.form === 'notice')
   ok(note !== undefined && note.content[0].text.includes('b'), '4. 说明行点名 b')
-  ok(note.content[0].text.includes('skill_autoload'), '4. 说明行可辨（skill_autoload 标记）')
+  ok(note.content[0].text.includes('未加载') && note.content[0].text.includes('不在当前 catalog'),
+    '4. 说明行说清 b 是「未加载（不在当前 catalog）」')
 }
 
 console.log('# 5. 一条都没成功也注入说明行（不许让人以为已经加载过）')
@@ -200,9 +213,9 @@ console.log('# 7. skill 工具在该 scope 不可见：退回 skills.get + rende
   })
   const decision = await h.step(G, 1)
   ok(h.executed.length === 0, '7. 工具不可见时不做注定 UNKNOWN_TOOL 的执行')
-  ok(decision.messages.length === 1 && decision.messages[0].source.kind === 'skill-autoload',
-    '7. 仍然注入正文（走 service）')
-  ok(decision.messages[0].content[0].text === '<skill_content name="a">正文</skill_content>',
+  const body = decision.messages.find((m) => m.source.form === 'instructions')
+  ok(body !== undefined && body.source.kind === 'skill-autoload', '7. 仍然注入正文（走 service）')
+  ok(body.content[0].text === '<skill_content name="a">正文</skill_content>',
     '7. 用的是宿主的 renderSkillContent')
 
   const noRenderer = ctxOf({
@@ -232,7 +245,7 @@ console.log('# 8. catalog 读不到：**不标记**、下一步重试（读不�
   ok(h.warnings.some((w) => w.includes('下一步重试')), '8. 出声说明会重试')
   const second = await h.step(I, 2)
   ok(h.executed.length === 1, '8. 第二次 pre-step 真的重试并加载成功')
-  ok(second.messages.length === 1, '8. 第二次注入正文')
+  ok(second.messages.filter((m) => m.source.form === 'instructions').length === 1, '8. 第二次注入正文')
   ok(h.warnings.filter((w) => w.includes('下一步重试')).length === 1, '8. 重试提示不刷屏（同 agent 只出声一次）')
 
   const missing = ctxOf({ config: { requiredSkills: ['a'] }, services: {} })
@@ -291,7 +304,7 @@ console.log('# 12. agent/pre-step 决策原样交回，只在末尾追加消息'
   const incoming = { kind: 'enter', messages: [{ id: 'msg-0', role: 'user', content: [], source: { kind: 'user' } }], startsRequestSeries: true }
   const decision = await h.step(Q, 9, incoming)
   ok(decision.kind === 'enter' && decision.startsRequestSeries === true, '12. 决策字段原样交回')
-  ok(decision.messages.length === 2 && decision.messages[0].id === 'msg-0', '12. 原有消息在前，注入在后')
+  ok(decision.messages.length === 3 && decision.messages[0].id === 'msg-0', '12. 原有消息在前，注入在后（说明 + 正文）')
 
   const rejecting = ctxOf({ config: { requiredSkills: ['a'] }, services: { skills: catalog('a') } })
   const rejected = await rejecting.step(Q, 9, { kind: 'reject' })
@@ -524,7 +537,28 @@ console.log('# 14. 宿主把 config 读成抛错（Cordis 代理）时，pre-ste
   }
   ok(stepError === null, '14. agent/pre-step 现读配置不抛错')
   ok(h.executed.length === 1 && h.executed[0].arguments.name === 'a', '14. 兜底读 apply(ctx, config) 的名单并自动加载')
-  ok(decision.messages.length === 1, '14. 注入正文')
+  ok(decision.messages.length === 2, '14. 注入说明 + 正文')
+}
+
+console.log('# 15. announce 开关：`off` 只关掉「全部加载成功」那条说明（没加载齐仍然出声）')
+{
+  const off = ctxOf({ config: { requiredSkills: ['a', 'b'], announce: 'off' }, services: { skills: catalog('a', 'b') } })
+  const decision = await off.step(S, 1)
+  ok(off.executed.length === 2, '15. off 不影响加载本身（照样逐个执行）')
+  ok(decision.messages.filter((m) => m.source.form === 'notice').length === 0, '15. off：全部成功时一条说明都不产生')
+  ok(decision.messages.filter((m) => m.source.form === 'instructions').length === 2, '15. off：正文照旧注入')
+
+  const offMissing = ctxOf({ config: { requiredSkills: ['a', 'zzz'], announce: 'off' }, services: { skills: catalog('a') } })
+  const partial = await offMissing.step(T, 1)
+  const stillSpoken = partial.messages.filter((m) => m.source.form === 'notice')
+  ok(stillSpoken.length === 1 && stillSpoken[0].content[0].text.includes('zzz'),
+    '15. off + 没加载齐：仍然出声并点名 zzz（状态不是装饰）')
+
+  const typo = ctxOf({ config: { requiredSkills: ['a'], announce: 'mk' }, services: { skills: catalog('a') } })
+  const typed = await typo.step(U, 1)
+  ok(typed.messages.filter((m) => m.source.form === 'notice').length === 1, '15. 认不出的取值按默认 marker 处理')
+  const parsed = Config['~standard'].validate({}).value.announce
+  ok((parsed && typeof parsed.get === 'function' ? parsed.get() : parsed) === 'marker', '15. Config 默认 announce 为 marker')
 }
 
 console.log(`\nskill-gate 自检：${checks} 条断言全过（插件不注册任何工具、不注册任何守卫）`)

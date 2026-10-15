@@ -7,6 +7,12 @@
  *   - `requiredSkills` 为空（默认）：什么都不做 —— 没配名单 = 不生效；
  *   - 非空：catalog 里有的逐个加载；不在 catalog 的忽略并出声；**一条都没成功也注入说明行**。
  *
+ * 注入分两种消息，都是 durable 的 `user/message`（客户端按来源分流：非 `user` 来源 = 注入的上下文行）：
+ *   - 正文（`form: 'instructions'`）：每份一份，给模型看；
+ *   - **一行短的说明**（`form: 'notice'`）：点名这次加载了哪几份、说明是机制触发而不是模型调用，
+ *     失败时点名缺哪份 —— 这就是用户能在对话里看见的那一行。`announce: 'off'` 只关掉「全部成功」
+ *     那条；**没加载齐是状态，出声不受开关影响**。
+ *
  * 「已加载」不是服务状态（`skills` 服务没有 isLoaded）：它就是**一次成功的 `skill` 工具执行**，
  * 所以本插件保留 `tools/result` 观察者作为**只读观测**（记录「这个会话加载过哪些」并汇总一行日志），
  * 而不是把同一条判定再实现一遍 —— 自动加载成立之后，拦截面（`tools/pre-execute` 守卫）已整体删除。
@@ -33,6 +39,8 @@ const DESCRIPTION_LIMIT = 120
 /** 插件配置。默认导出必须带上它，Loader 才投影得出条目配置、插件页才渲染配置表单。 */
 export const Config = z.object({
   requiredSkills: z.array(z.string()).default([]).volatile(),
+  /** 是否在会话里留一条**可见**的自动加载说明：`marker`（默认）/ `off`；认不出的取值按 `marker`。 */
+  announce: z.string().default('marker').volatile(),
 })
 
 /** 自动加载那次执行的 callId 前缀：与模型发起的调用可区分，日志里一眼可辨。 */
@@ -153,6 +161,33 @@ function readRequiredSkills(sources) {
   return []
 }
 
+/** `announce` 的合法取值。 */
+const ANNOUNCE_MODES = new Set(['marker', 'off'])
+
+function normalizeAnnounce(value) {
+  const raw = unwrap(value)
+  return typeof raw === 'string' && ANNOUNCE_MODES.has(raw.trim()) ? raw.trim() : 'marker'
+}
+
+/**
+ * 现读 `announce`：与必读名单同一套读法（宿主现读的那份优先，退回 `apply(ctx, config)` 那份）。
+ * 认不出的取值一律按默认的 `marker` 处理 —— 显示开关不该因为拼错而变成静默关闭。
+ */
+function readAnnounce(sources) {
+  for (const source of sources) {
+    if (!source) continue
+    let raw
+    try {
+      raw = source.announce
+    } catch {
+      raw = undefined
+    }
+    const value = unwrap(raw)
+    if (typeof value === 'string') return normalizeAnnounce(value)
+  }
+  return 'marker'
+}
+
 /**
  * 当前 workspace 的 cwd，拿不到就 undefined。
  * `skill` 工具的 lookup 与只读路由共用这一份，别各写一遍。
@@ -261,12 +296,21 @@ async function loadSkill(ctx, agent, signal, name, helpers: HostHelpers) {
   }
 }
 
-/** 加载不齐时注入的说明行：**一条都没成功也要有它**，否则会让人以为已经自动加载过了。 */
-function autoloadNoteText(missing) {
-  return (
-    '<skill_autoload>必读 skill 未能全部加载：' + missing.join('；') + '。' +
-    '不要假定这些纪律已在上下文中；需要时用 `skill` 工具显式加载。</skill_autoload>'
-  )
+/**
+ * 会话里那条**可见且短**的说明。
+ *
+ * 它同时是模型与本步输入里的收尾句：点名这次自动加载了哪几份、说明是机制触发而不是模型调用；
+ * 没加载齐（含一条都没成功）时点名缺哪份 —— 后者是**状态**，不是装饰，所以 `announce: off` 也拦不住它。
+ */
+function autoloadMarkerText(loadedNames, missing) {
+  const head = 'skill-gate：会话开始自动加载（机制触发，不是模型调用）'
+  if (loadedNames.length === 0) {
+    return `${head}未完成 —— 未加载：${missing.join('；')}。不要假定这些纪律已在上下文中。`
+  }
+  const done = `已加载 ${loadedNames.join('、')}`
+  return missing.length === 0
+    ? `${head}：${done}。`
+    : `${head}：${done}；未加载：${missing.join('；')}。`
 }
 
 /**
@@ -436,6 +480,7 @@ export function buildSkillIndex(list: unknown): { skills: Array<{ name: string; 
  */
 export function apply(ctx, config, deps: HostHelpers = {}) {
   const requiredNow = () => readRequiredSkills([liveConfig(ctx), config])
+  const announceNow = () => readAnnounce([liveConfig(ctx), config])
   const helpersPromise = resolveHostHelpers(deps)
 
   // 会话开始自动加载：`agent/pre-step` 的**首次触发**是唯一能赶在第一条模型请求前
@@ -451,6 +496,8 @@ export function apply(ctx, config, deps: HostHelpers = {}) {
 
     const required = requiredNow()
     if (required.length === 0) return decision // 没配名单 = 不生效
+
+    const announce = announceNow()
 
     // 拿不到宿主的消息构造器就没有交付面：出声一次、本会话不再重试（否则每步都会重复执行加载）。
     const helpers = await helpersPromise
@@ -471,6 +518,7 @@ export function apply(ctx, config, deps: HostHelpers = {}) {
     if (unknown.length > 0) warnUnknown(ctx, unknown)
 
     const messages = []
+    const loadedNames = []
     const missing = unknown.map((item) => `${item}（不在当前 catalog）`)
     for (const skillName of required) {
       if (!catalog.has(skillName)) continue
@@ -479,16 +527,20 @@ export function apply(ctx, config, deps: HostHelpers = {}) {
         missing.push(`${skillName}（${loaded.reason}）`)
         continue
       }
+      loadedNames.push(skillName)
       messages.push(helpers.createUserMessage({
         content: loaded.content,
         source: { kind: 'skill-autoload', name: skillName, form: 'instructions' },
       }))
     }
 
-    // 一条都没成功也要注入说明行：否则「配了名单」看起来就像「已经加载过了」。
-    if (missing.length > 0) {
-      const text = autoloadNoteText(missing)
-      messages.push(helpers.createUserMessage({
+    // 一条**可见且短**的说明，排在正文之前（读起来先看到「发生了什么」，再是那几份正文）。
+    // 它进的是 durable 会话（agent-loop 把 decision.messages 逐条 append 成 user/message），
+    // 客户端把非 `user` 来源的这类行渲染成**注入的上下文行**（生产者也因此看得见）。
+    // `announce: off` 只关掉「全部加载成功」那条；没加载齐是状态，出声不受开关影响。
+    if (announce !== 'off' || missing.length > 0) {
+      const text = autoloadMarkerText(loadedNames, missing)
+      messages.unshift(helpers.createUserMessage({
         content: [{ type: 'text', text }],
         source: { kind: 'skill-autoload', name: '*', form: 'notice', summary: clipText(text, 120) },
       }))
