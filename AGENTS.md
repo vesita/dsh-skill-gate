@@ -3,11 +3,16 @@
 本仓是一个 DeepSeek Harness 插件包。它解决什么问题、怎么配置、边界在哪，写在 `README.md`；
 本文件只写改这个仓时要遵守的规则。
 
-## 自检与打包
+## 文件布局与构建
+
+- `src/index.ts` —— 宿主半边（判定语义、Config、门禁）。
+- `src/client.ts` —— 客户端半边（插件页的配置区）。产出的 `lib/client.js` 是给浏览器加载的。
+- `lib/` 是构建产物，不提交；发布走 `pnpm pack`（`prepack` 会先 build）。
 
 ```bash
 pnpm install          # 只为自检与打包；node_modules 不提交
-node selfcheck.mjs    # 判定逻辑自检；退出码即判据（0 = 全过）
+pnpm run build        # tsc 两趟：宿主 -> lib/index.js + lib/index.d.ts，客户端 -> lib/client.js
+pnpm test             # build + node selfcheck.mjs；退出码即判据（0 = 全过）
 pnpm pack             # 产出 dsh-skill-gate-<version>.tgz
 ```
 
@@ -18,14 +23,21 @@ mv dsh-skill-gate-<version>.tgz "$DSH_HOME/packages/"
 dsh plugin --profile <profile> add "file:$DSH_HOME/packages/dsh-skill-gate-<version>.tgz"
 ```
 
-改完要**重启 dsh** 才生效。`<profile>/node_modules/dsh-skill-gate/` 是安装产物，**不要手改**
-（重装即被覆盖，改本仓）。同一台机器上多个 profile 共用同一个 `node_modules`（软链）时，
+改完**重启 dsh** 才生效（宿主半边与客户端半边都是启动时装载的）。`requiredSkills` 的值例外：
+它是 volatile 字段，在插件页改完保存即生效。`<profile>/node_modules/dsh-skill-gate/` 是安装产物，
+**不要手改**（重装即被覆盖，改本仓）。同一台机器上多个 profile 共用同一个 `node_modules`（软链）时，
 装其中一个即可。
 
 ## 改代码时
 
-- `index.js` 是唯一实现。`Config` 必须挂在默认导出上（`export default { name, inject, apply, Config }`）——
-  Loader 从插件对象的 `Config` 投影条目配置，漏了插件页的配置表单会整张空白。
+- 宿主半边的实现只在 `src/index.ts`。`Config` 必须挂在默认导出上
+  （`export default { name, inject, apply, Config }`）—— Loader 从插件对象的 `Config` 投影条目配置，
+  漏了插件页的配置表单会整张空白。
+- `src/client.ts` 全文件**不用 JSX**，只用 `require('react')` + `React.createElement`：
+  自动 jsx runtime 从 `props.children` 取 children，与 `createElement` 的第三参数混用会静默渲染空元素。
+  浏览器半边的加载协议是外层的 `__ModuleLoader__.load({ id, factory })` 包装，`id` 必须是包名。
+- 配置区注册在 `plugins.bundle.config`（key = 包名）与 `plugins.row.config`（key = `<包名>#<行 id>`）
+  两处；保存/丢弃语义走官方 `SettingsFormModel` + `SettingsForm`，不要自己实现写回。
 - 判定语义、受保护工具名单与已知边界都写在 `README.md`；改行为就同步改它，别在两处各写一份。
 - 拒绝文案只引用配置里的名字与 `skill({ name: "…" })` 这种写法，**不要写死任何具体 skill 名**。
 - 往受保护名单里加名字之前先问一句：拦错了会不会挡住纯探查？加了就在 `selfcheck.mjs` 补对应断言。

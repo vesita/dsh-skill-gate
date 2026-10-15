@@ -1,7 +1,8 @@
 // dsh-skill-gate 的判定逻辑自检：不依赖 dsh 运行时，用假 ctx 喂事件，逐条断言。
-// 退出码即判据：0 = 全过。
+// 判据是**构建产物**（`lib/index.js`），不是源码 —— 发布出去的就是它。
+// 先 `pnpm run build`（`pnpm test` 已经带上了），退出码即判据：0 = 全过。
 import assert from 'node:assert/strict'
-import plugin, { apply, Config } from './index.js'
+import plugin, { apply, Config } from './lib/index.js'
 
 let checks = 0
 function ok(cond, label) {
