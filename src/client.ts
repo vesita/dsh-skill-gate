@@ -4,12 +4,16 @@
     /**
      * dsh-skill-gate 的浏览器半边：侧边栏「插件」页里本插件那张卡上的配置区。
      *
-     * 卡片里编辑 `requiredSkills`：本轮必须成功加载的 skill 名单，一行一个名字（也支持逗号分隔）。
-     * 留空就是「没配必读名单」—— 门禁不生效。
+     * 这里编辑 `requiredSkills` —— 本轮必须成功加载的 skill 名单。候选来自宿主半边的只读路由
+     * `GET /dsh-skill-gate/skill-index`（浏览器拿不到 catalog，只能由宿主交出来），画成复选列表
+     * 加一个过滤框；配置里有、但当前 catalog 里没有的名字单独一组保留下来。
      *
-     * 偏好不在这里自存：表单是 `configForms` 上这张配置的控制器，写进去的字段就是本插件在
-     * profile 里的 Config。保存与丢弃的语义由官方表单原语承担（暂存草稿、点保存才写 Host、
-     * 失败保留草稿并给出反馈），本卡片只画一个多行输入。
+     * 勾选状态不是本组件的局部状态：它**就是**配置字段的草稿文本（一行一个名字）。点一下复选框
+     * = `props.edit(FIELD, 新文本)`，保存与丢弃仍由官方 `SettingsFormModel` / `SettingsForm`
+     * 承担 —— 本卡片不自己写回 Host。
+     *
+     * 路由拿不到数据（老版本宿主 / 非 web profile / 服务缺失）时退回「一行一个名字」的文本框，
+     * 并在界面上说明为什么退化；绝不白屏。
      *
      * 手写 `__ModuleLoader__.load` 包装是浏览器半边的加载协议：客户端插件以「一个自带 id 的
      * 工厂」注册，`require` 由加载器注入。全文件不使用 JSX —— `React.createElement` 的第三个
@@ -38,11 +42,52 @@
     const BUNDLE_KEY = 'dsh-skill-gate'
     /** 行配置区的 key：`<包名>#<patch 里声明的行 id>`。 */
     const ROW_KEY = 'dsh-skill-gate#skill-gate'
+    /** 宿主半边注册的只读 catalog 路由。 */
+    const SKILL_ROUTE = '/dsh-skill-gate/skill-index'
 
-    /** 多行输入的字号/间距：与设置页其它字段同一套节奏。 */
     const styles: Record<string, any> = {
-      page: { display: 'flex', flexDirection: 'column', gap: '6px', padding: '12px 0' },
+      page: { display: 'flex', flexDirection: 'column', gap: '8px', padding: '12px 0' },
       label: { color: 'var(--dsw-alias-label-primary)', fontSize: '13px', fontWeight: 500, lineHeight: 1.5 },
+      hint: { color: 'var(--dsw-alias-label-tertiary)', margin: 0, fontSize: '12px', lineHeight: 1.5 },
+      failed: { color: 'var(--dsw-alias-label-error)', margin: 0, fontSize: '12px', lineHeight: 1.5 },
+      group: { display: 'flex', flexDirection: 'column', gap: '2px' },
+      groupHead: { color: 'var(--dsw-alias-label-secondary)', fontSize: '12px', lineHeight: 1.5, marginTop: '4px' },
+      groupHeadWarn: { color: 'var(--dsw-alias-label-error)', fontSize: '12px', lineHeight: 1.5, marginTop: '4px' },
+      filter: {
+        font: 'inherit',
+        width: '100%',
+        boxSizing: 'border-box',
+        height: '30px',
+        border: '0.5px solid var(--dsw-alias-border-l4)',
+        background: 'var(--dsw-alias-bg-layer-3)',
+        color: 'var(--dsw-alias-label-primary)',
+        borderRadius: '8px',
+        padding: '0 10px',
+        fontSize: '13px'
+      },
+      row: { display: 'flex', gap: '8px', alignItems: 'flex-start', padding: '3px 0', cursor: 'pointer' },
+      checkbox: { flex: 'none', marginTop: '2px' },
+      col: { display: 'flex', flexDirection: 'column', gap: '1px', minWidth: 0, flex: 1 },
+      skillName: {
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        fontSize: '13px',
+        lineHeight: 1.5,
+        color: 'var(--dsw-alias-label-primary)'
+      },
+      skillNameWarn: {
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        fontSize: '13px',
+        lineHeight: 1.5,
+        color: 'var(--dsw-alias-label-error)'
+      },
+      desc: {
+        color: 'var(--dsw-alias-label-tertiary)',
+        fontSize: '12px',
+        lineHeight: 1.5,
+        whiteSpace: 'nowrap',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis'
+      },
       textarea: {
         font: 'inherit',
         width: '100%',
@@ -69,9 +114,7 @@
         fontSize: '12px',
         lineHeight: 1.5,
         color: 'var(--dsw-alias-label-secondary)'
-      },
-      hint: { color: 'var(--dsw-alias-label-tertiary)', margin: 0, fontSize: '12px', lineHeight: 1.5 },
-      failed: { color: 'var(--dsw-alias-label-error)', margin: 0, fontSize: '12px', lineHeight: 1.5 }
+      }
     }
 
     /**
@@ -92,9 +135,20 @@
       return out
     }
 
+    /** 按 catalog 的顺序排列勾选结果，catalog 里没有的名字排在最后（相互保持原顺序）。 */
+    function orderedNames(selected: string[], catalogOrder: string[]): string[] {
+      const rank: Record<string, number> = {}
+      catalogOrder.forEach((name, index) => { rank[name] = index })
+      return selected.slice().sort((a, b) => {
+        const ra = a in rank ? rank[a] : catalogOrder.length
+        const rb = b in rank ? rank[b] : catalogOrder.length
+        return ra - rb
+      })
+    }
+
     /**
      * 数组字段的转换 spec：存的是 `string[]`，草稿是「一行一个」的文本。
-     * 空文本走 `clear`（清掉用户层、回到 schema 默认的 `[]`），正好等于「留空 = 门禁不生效」。
+     * 空文本走 `clear`（清掉用户层、回到 schema 默认的 `[]`），正好等于「一个都不勾 = 门禁不生效」。
      */
     const requiredSkillsField = {
       field: FIELD,
@@ -139,14 +193,54 @@
       }
 
       /**
-       * 卡片正文：一个多行输入 + 覆盖标记 + 保存反馈。
-       * 保存栏画什么、什么时候可写、失败怎么提示，全部由官方 `SettingsForm` 决定。
+       * 卡片正文。
+       *
+       * 勾选态**派生**自字段草稿文本，不另存一份局部状态 —— 于是「用户点了复选框」与
+       * 「官方表单的暂存值」天然是同一份东西，不会出现两处打架。
        */
       function SkillGateConfigEntry(props: any) {
         const state = props.useSkillGateForm((snapshot: any) => snapshot)
+        const [catalog, setCatalog] = React.useState({
+          status: 'loading',
+          skills: [],
+          error: null
+        } as { status: 'loading' | 'ready' | 'error'; skills: Array<{ name: string; description: string }>; error: string | null })
+        const [filter, setFilter] = React.useState('')
         const [notice, setNotice] = React.useState(null as string | null)
         // 只有「从脏变干净、且不是因为失败」才算一次落地的保存，避免首屏就显示「已保存」。
         const wasDirty = React.useRef(false)
+
+        // catalog 只取一次：它是候选列表，与当前草稿无关。
+        React.useEffect(() => {
+          let live = true
+          const load = async () => {
+            try {
+              const response = await fetch(SKILL_ROUTE, { headers: { accept: 'application/json' } })
+              const payload: any = await response.json().catch(() => null)
+              if (!response.ok) throw new Error((payload && payload.error) || 'HTTP ' + response.status)
+              if (!payload || !Array.isArray(payload.skills)) throw new Error('返回的形状不是 { skills: [...] }')
+              if (!live) return
+              const items = payload.skills
+                .filter((item: any) => item && typeof item.name === 'string' && item.name !== '')
+                .map((item: any) => ({
+                  name: item.name,
+                  description: typeof item.description === 'string' ? item.description : ''
+                }))
+                .sort((a: any, b: any) => a.name.localeCompare(b.name))
+              setCatalog({ status: 'ready', skills: items, error: null })
+            } catch (error) {
+              if (!live) return
+              // 读不到就退回文本框：说明为什么退化，绝不白屏。
+              setCatalog({
+                status: 'error',
+                skills: [],
+                error: (error && error.message) || '无法读取 skill 列表'
+              })
+            }
+          }
+          void load()
+          return () => { live = false }
+        }, [])
 
         React.useEffect(() => {
           if (state.shell.dirty) {
@@ -167,51 +261,148 @@
 
         const field = state[FIELD]
         const locked = !state.shell.writable || state.shell.saving
+        const selected = splitNames(field.text)
+        const catalogOrder = catalog.skills.map((item: any) => item.name)
+        const catalogNames: Record<string, boolean> = {}
+        catalogOrder.forEach((name: string) => { catalogNames[name] = true })
+        // 配置里有、catalog 里没有的名字：单独一组保留，默认勾选（它们本来就在名单里）。
+        const configuredUnknown = selected.filter((name) => !catalogNames[name])
+
+        /** 点一下复选框：改的是字段草稿文本，不碰路由数据。 */
+        const toggle = (name: string) => {
+          const next = selected.slice()
+          const at = next.indexOf(name)
+          if (at === -1) next.push(name)
+          else next.splice(at, 1)
+          props.edit(FIELD, orderedNames(next, catalogOrder).join('\n'))
+        }
+
+        const keyword = filter.trim().toLowerCase()
+        const visible = keyword === ''
+          ? catalog.skills
+          : catalog.skills.filter((item: any) =>
+              item.name.toLowerCase().indexOf(keyword) !== -1 ||
+              item.description.toLowerCase().indexOf(keyword) !== -1)
+
+        const selectionLine = selected.length === 0
+          ? '当前一个都没勾：名单为空，门禁不生效（这是刻意的：没配名单就不拦）。'
+          : '已勾选 ' + selected.length + ' 份：' + selected.join('、')
+
+        /** 降级路径：路由不可用时回到上一版的「一行一个名字」。 */
+        const fallbackEditor = () => h(
+          'div',
+          { style: styles.page, key: 'fallback' },
+          h('p', { style: styles.failed, role: 'status' },
+            '无法读取 skill 列表（' + (catalog.error || '未知原因') + '），已退回手动输入。'),
+          h('label', { style: styles.label, htmlFor: 'dsh-skill-gate-required' }, '必读 skill 名单'),
+          h('p', { style: styles.hint }, '一行一个名字（也支持逗号分隔）。留空 = 没配名单，门禁不生效。'),
+          h('textarea', {
+            id: 'dsh-skill-gate-required',
+            style: styles.textarea,
+            rows: 4,
+            spellCheck: false,
+            disabled: locked,
+            placeholder: 'your-required-skill',
+            value: field.text,
+            onChange: (event: any) => { props.edit(FIELD, event.target.value) }
+          })
+        )
+
+        /** 勾选列表：catalog 组 + 「已配置但不在 catalog」组。 */
+        const checklist = () => h(
+          'div',
+          { style: styles.page, key: 'checklist' },
+          h('label', { style: styles.label }, '必读 skill 名单'),
+          h('p', { style: styles.hint }, '勾上本轮必须成功加载的 skill。一个都不勾 = 名单为空 = 门禁不生效。'),
+          catalog.status === 'loading'
+            ? h('p', { style: styles.hint, role: 'status' }, '正在读取 skill 列表…')
+            : null,
+          h('input', {
+            type: 'text',
+            style: styles.filter,
+            placeholder: '过滤 skill 名或描述',
+            value: filter,
+            disabled: locked,
+            onChange: (event: any) => { setFilter(event.target.value) }
+          }),
+          h(
+            'div',
+            { style: styles.group },
+            h('div', { style: styles.groupHead }, '当前 catalog（' + catalog.skills.length + ' 份）'),
+            catalog.status === 'ready' && catalog.skills.length === 0
+              ? h('p', { style: styles.hint }, '当前 catalog 里一份 skill 都没有。')
+              : null,
+            catalog.status === 'ready' && catalog.skills.length > 0 && visible.length === 0
+              ? h('p', { style: styles.hint }, '没有匹配「' + filter.trim() + '」的 skill。')
+              : null,
+            visible.map((item: any) => h(
+              'label',
+              { key: item.name, style: styles.row },
+              h('input', {
+                type: 'checkbox',
+                style: styles.checkbox,
+                checked: selected.indexOf(item.name) !== -1,
+                disabled: locked,
+                onChange: () => { toggle(item.name) }
+              }),
+              h(
+                'span',
+                { style: styles.col },
+                h('span', { style: styles.skillName }, item.name),
+                item.description === ''
+                  ? null
+                  : h('span', { style: styles.desc, title: item.description }, item.description)
+              )
+            ))
+          ),
+          configuredUnknown.length === 0 ? null : h(
+            'div',
+            { style: styles.group },
+            h('div', { style: styles.groupHeadWarn },
+              '已配置但当前 catalog 里没有（' + configuredUnknown.length + ' 份）'),
+            h('p', { style: styles.hint },
+              '这些名字不在列表里：可能已改名 / 删除，或属于项目级 skill。默认保留；取消勾选即从名单里去掉。'),
+            configuredUnknown.map((name) => h(
+              'label',
+              { key: name, style: styles.row },
+              h('input', {
+                type: 'checkbox',
+                style: styles.checkbox,
+                checked: true,
+                disabled: locked,
+                onChange: () => { toggle(name) }
+              }),
+              h('span', { style: styles.col }, h('span', { style: styles.skillNameWarn }, name))
+            ))
+          ),
+          h('p', { style: styles.hint, role: 'status' }, selectionLine)
+        )
 
         return h(
           SettingsForm,
           { labels: formLabels, state: state.shell, onSave: props.save, onDiscard: props.discard },
-          h(
-            'div',
-            { style: styles.page },
-            h('label', { style: styles.label, htmlFor: 'dsh-skill-gate-required' }, '必读 skill 名单'),
-            h(
-              'p',
-              { style: styles.hint },
-              '本轮必须成功加载的 skill；一行一个名字（也支持逗号分隔）。留空 = 没配名单，门禁不生效。'
-            ),
-            h('textarea', {
-              id: 'dsh-skill-gate-required',
-              style: styles.textarea,
-              rows: 4,
-              spellCheck: false,
-              disabled: locked,
-              placeholder: 'your-required-skill',
-              value: field.text,
-              onChange: (event: any) => { props.edit(FIELD, event.target.value) }
-            }),
-            field.overridden
-              ? h(
-                  'div',
-                  { style: styles.controls },
-                  h('span', { style: styles.badge }, '已覆盖'),
-                  h(
-                    'button',
-                    {
-                      type: 'button',
-                      style: styles.reset,
-                      disabled: locked,
-                      onClick: () => { props.resetField(FIELD) }
-                    },
-                    '恢复默认'
-                  )
+          catalog.status === 'error' ? fallbackEditor() : checklist(),
+          field.overridden
+            ? h(
+                'div',
+                { style: styles.controls },
+                h('span', { style: styles.badge }, '已覆盖'),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    style: styles.reset,
+                    disabled: locked,
+                    onClick: () => { props.resetField(FIELD) }
+                  },
+                  '恢复默认'
                 )
-              : null,
-            state.shell.failed
-              ? h('p', { style: styles.failed, role: 'status' }, '保存失败，改动未生效。')
-              : null,
-            notice !== null ? h('p', { style: styles.hint, role: 'status' }, notice) : null
-          )
+              )
+            : null,
+          state.shell.failed
+            ? h('p', { style: styles.failed, role: 'status' }, '保存失败，改动未生效。')
+            : null,
+          notice !== null ? h('p', { style: styles.hint, role: 'status' }, notice) : null
         )
       }
 
@@ -242,6 +433,7 @@
     exports.apply = apply
     exports.inject = inject
     exports.splitNames = splitNames
+    exports.orderedNames = orderedNames
     return module.exports
   }
 })

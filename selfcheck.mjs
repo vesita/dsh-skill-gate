@@ -11,17 +11,19 @@ function ok(cond, label) {
   console.log('  ok  ' + label)
 }
 
-/** 假 ctx：手写 on / tools.guard / tools.register / get / logger，config 可在运行中替换。
+/** 假 ctx：手写 on / tools.guard / tools.register / get / logger / inject，config 可在运行中替换。
  *  `configThrows` 复刻 Cordis 代理的行为：未 inject 的属性**抛错**，不是 undefined。 */
 function makeCtx(opts = {}) {
   const handlers = new Map()
   const registered = []
   const warnings = []
+  const injects = []
   const services = opts.services ?? {}
   let guardFn = null
   const ctx = {
     on(event, fn) { handlers.set(event, fn) },
     get(name) { return services[name] },
+    inject(names, callback) { injects.push({ names, callback }); return () => {} },
     logger: { warn: (m) => { warnings.push(String(m)) }, info() {}, error() {} },
     tools: {
       guard(fn) { guardFn = fn },
@@ -40,6 +42,7 @@ function makeCtx(opts = {}) {
     ctx,
     registered,
     warnings,
+    injects,
     guard: (exec) => guardFn(exec),
     step: (agent, turn) =>
       handlers.get('agent/pre-step')({ agent, turn, signal: undefined }, async () => ({ kind: 'enter', messages: [] })),
@@ -263,6 +266,126 @@ console.log('# 9. agent/pre-step 决策原样交回')
   const decision = await handlers.step(A, 9)
   assert.deepEqual(decision, { kind: 'enter', messages: [] })
   ok(true, '9. waterfall 决策逐字段原样交回')
+}
+
+console.log('# 10. 宿主只读路由：不起浏览器也能验注册与返回形状')
+{
+  /** 假 res：只实现 handler 用到的那几个方法（writeHead / setHeader / end）。 */
+  function fakeRes() {
+    return {
+      statusCode: 200,
+      headersSent: false,
+      headers: {},
+      body: undefined,
+      setHeader(key, value) { this.headers[key.toLowerCase()] = value },
+      writeHead(code, headers) {
+        this.statusCode = code
+        this.headersSent = true
+        if (headers) for (const key of Object.keys(headers)) this.headers[key.toLowerCase()] = headers[key]
+      },
+      end(body) { if (body !== undefined) this.body = String(body) },
+    }
+  }
+  /** 把一个 ctx 的 webServer 订阅召唤起来，返回捕获到的路由表。 */
+  function mountRoutes(h) {
+    const routes = []
+    const subscribed = h.injects.filter((entry) => entry.names.includes('webServer'))
+    for (const entry of subscribed) {
+      entry.callback({
+        webServer: { register(route) { routes.push(route); return () => {} } },
+        effect(fn) { return fn() },
+      })
+    }
+    return { routes, subscribed: subscribed.length }
+  }
+
+  const longDescription = 'x'.repeat(200)
+  const h = ctxOf({
+    config: { requiredSkills: [] },
+    services: {
+      connection: { requestRejection: () => undefined },
+      skills: {
+        list: async () => [
+          { name: 'zeta-skill', description: longDescription },
+          { name: 'alpha-skill', description: '第一份' },
+          { name: '', description: '没有名字，应被丢掉' },
+        ],
+      },
+    },
+  })
+  const { routes, subscribed } = mountRoutes(h)
+  ok(subscribed === 1, '10. 只对 webServer 订阅一次（拿不到服务就不会注册路由）')
+  ok(routes.length === 1, '10. webServer 在场时注册恰好一条路由')
+  ok(routes[0] && routes[0].kind === 'exact', "10. 路由 kind 是 'exact'")
+  ok(routes[0] && routes[0].path === '/dsh-skill-gate/skill-index', '10. 路由路径是 /dsh-skill-gate/skill-index')
+
+  const res = fakeRes()
+  await routes[0].handler({ method: 'GET' }, res)
+  const body = JSON.parse(res.body)
+  ok(res.statusCode === 200, '10. GET 返回 200')
+  ok(Array.isArray(body.skills) && body.skills.length === 2, '10. 丢掉没有名字的条目后剩两条')
+  ok(body.skills[0].name === 'alpha-skill' && body.skills[1].name === 'zeta-skill', '10. 按名字排序')
+  ok(body.skills[1].description.length === 121 && body.skills[1].description.endsWith('…'),
+    '10. 长描述截断到 120 字加省略号')
+  ok(typeof body.skills[0].description === 'string' && !('content' in body.skills[0]),
+    '10. 载荷只有名字与描述，没有正文')
+
+  const post = fakeRes()
+  await routes[0].handler({ method: 'POST' }, post)
+  ok(post.statusCode === 405 && post.headers.allow === 'GET', '10. 非 GET 返回 405 且带 Allow: GET')
+
+  // 围栏：拿不到 connection 就不服务（fail-closed）。
+  const noFence = ctxOf({ config: { requiredSkills: [] }, services: { skills: { list: async () => [] } } })
+  const noFenceRoutes = mountRoutes(noFence).routes
+  const fenced = fakeRes()
+  await noFenceRoutes[0].handler({ method: 'GET' }, fenced)
+  ok(fenced.statusCode === 503 && JSON.parse(fenced.body).error.includes('fail-closed'),
+    '10. 拿不到 connection.requestRejection：503 且不服务')
+
+  // 围栏拒绝：把 connection 给的状态码原样交回。
+  const rejecting = ctxOf({
+    config: { requiredSkills: [] },
+    services: { connection: { requestRejection: () => 403 }, skills: { list: async () => [] } },
+  })
+  const rejectRes = fakeRes()
+  await mountRoutes(rejecting).routes[0].handler({ method: 'GET' }, rejectRes)
+  ok(rejectRes.statusCode === 403, '10. 围栏拒绝时把状态码原样交回')
+
+  // skills 服务缺席 / list 抛错：明确错误形状，不抛穿。
+  const noSkills = ctxOf({ config: { requiredSkills: [] }, services: { connection: { requestRejection: () => undefined } } })
+  const noSkillsRes = fakeRes()
+  await mountRoutes(noSkills).routes[0].handler({ method: 'GET' }, noSkillsRes)
+  ok(noSkillsRes.statusCode === 503 && typeof JSON.parse(noSkillsRes.body).error === 'string',
+    '10. skills 服务缺席：503 + { error }')
+
+  const boom = ctxOf({
+    config: { requiredSkills: [] },
+    services: {
+      connection: { requestRejection: () => undefined },
+      skills: { list: async () => { throw new Error('boom') } },
+    },
+  })
+  const boomRes = fakeRes()
+  let handlerThrew = null
+  try {
+    await mountRoutes(boom).routes[0].handler({ method: 'GET' }, boomRes)
+  } catch (e) {
+    handlerThrew = e
+  }
+  ok(handlerThrew === null && boomRes.statusCode === 502 && JSON.parse(boomRes.body).error.includes('boom'),
+    '10. list 抛错：502 + { error }，异常不抛穿')
+
+  // 非 web profile：webServer 缺席（订阅从不触发）时 apply 不报错，也不注册路由。
+  const noWeb = ctxOf({ config: { requiredSkills: [] } })
+  ok(noWeb.injects.length === 1 && noWeb.injects[0].names.join(',') === 'webServer',
+    '10. 只留一条 webServer 订阅，订阅未触发时不注册路由（非 web profile 优雅降级）')
+  let badWebThrew = null
+  try {
+    noWeb.injects[0].callback({ webServer: {}, effect(fn) { return fn() } })
+  } catch (e) {
+    badWebThrew = e
+  }
+  ok(badWebThrew === null, '10. webServer 形状不对时静默跳过，不抛')
 }
 
 console.log(`\nskill-gate 自检：${checks} 条断言全过（插件不注册任何工具）`)

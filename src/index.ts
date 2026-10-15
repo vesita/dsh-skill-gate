@@ -13,10 +13,17 @@
  * 一行 warning；取不到 catalog（skills 服务缺席或调用失败）时保持严格。
  */
 
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import z from '@deepseek-ai/schemastery'
 
 export const name = 'skill-gate'
 export const inject = ['tools']
+
+/** 浏览器读 catalog 的只读路由。浏览器拿不到 catalog，这条路由是双方唯一的共享事实。 */
+export const SKILL_INDEX_ROUTE = '/dsh-skill-gate/skill-index'
+
+/** 描述过网前截断到多少字符 —— 整份正文没有理由进浏览器。 */
+const DESCRIPTION_LIMIT = 120
 
 /** 插件配置。默认导出必须带上它，Loader 才投影得出条目配置、插件页才渲染配置表单。 */
 export const Config = z.object({
@@ -189,6 +196,99 @@ function denyMissing(toolName, missing) {
   )
 }
 
+/**
+ * 浏览器读 catalog 的只读路由（`GET /dsh-skill-gate/skill-index`）。
+ *
+ * 形状照 dsh 生态里同类的只读 loopback 路由：`ctx.inject(['webServer'], …)` 拿可选服务，
+ * `webServer.register({ kind: 'exact', path, handler })` 挂上去，返回的 disposer 交给 `effect`；
+ * 拿不到 `connection` 时 fail-closed 不服务。
+ *
+ * `webServer` 是**可选**服务：非 web profile（没有 web server）时整段静默跳过，宿主半边绝不
+ * 因此报错。载荷只有名字与截断后的描述，不含路径、不含正文。
+ */
+function installClientRoute(ctx) {
+  ctx.inject(['webServer'], (webCtx) => {
+    try {
+      const webServer = webCtx.webServer
+      if (!webServer || typeof webServer.register !== 'function') return
+      webCtx.effect(() => webServer.register({
+        kind: 'exact',
+        path: SKILL_INDEX_ROUTE,
+        handler: async (req: IncomingMessage, res: ServerResponse) => {
+          // 围栏：拿不到 connection 就不服务（fail-closed）。这条载荷不含路径，但先例如此，
+          // 少一道闸就少一道 —— 静默 fail-open 是要单独论证的例外，这里不给自己开。
+          const connection = ctx.get('connection')
+          let rejection: number | undefined
+          try {
+            if (!connection || typeof connection.requestRejection !== 'function') {
+              sendJson(res, 503, { error: '围栏缺席：拿不到 connection.requestRejection，拒绝服务（fail-closed）' })
+              return
+            }
+            rejection = connection.requestRejection(req)
+          } catch (e) {
+            sendJson(res, 503, { error: '围栏检查失败，拒绝服务（fail-closed）' })
+            return
+          }
+          if (rejection !== undefined) {
+            res.statusCode = rejection
+            res.end()
+            return
+          }
+          if (req.method !== 'GET') {
+            res.setHeader('Allow', 'GET')
+            sendJson(res, 405, { error: '仅支持 GET' })
+            return
+          }
+
+          const skills = ctx.get('skills')
+          if (!skills || typeof skills.list !== 'function') {
+            sendJson(res, 503, { error: '这个部署没有可用的 skills 服务，无法列出 catalog' })
+            return
+          }
+          let list
+          try {
+            // 不带 cwd 列一次：列的是**不带项目上下文的 catalog**，项目级 skill 可能不在里面。
+            list = await skills.list({})
+          } catch (e) {
+            sendJson(res, 502, { error: '读取 catalog 失败：' + String((e && e.message) || e) })
+            return
+          }
+          if (!Array.isArray(list)) {
+            sendJson(res, 502, { error: 'catalog 返回的不是列表' })
+            return
+          }
+          sendJson(res, 200, buildSkillIndex(list))
+        }
+      }), `dsh-skill-gate: GET ${SKILL_INDEX_ROUTE}`)
+    } catch (e) {}
+  })
+}
+
+function sendJson(res: ServerResponse, statusCode: number, payload: unknown): void {
+  if (res.headersSent) return
+  res.writeHead(statusCode, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store'
+  })
+  res.end(JSON.stringify(payload))
+}
+
+/** 截断过网的说明文字；非字符串按空串处理。 */
+function clipText(value: unknown, limit: number): string {
+  const text = typeof value === 'string' ? value : ''
+  return text.length <= limit ? text : text.slice(0, limit) + '…'
+}
+
+/** 把 catalog 列表折成过网的形状：只有名字与截断后的描述，按名字排序。 */
+export function buildSkillIndex(list: unknown): { skills: Array<{ name: string; description: string }> } {
+  const items = Array.isArray(list) ? list : []
+  const skills = items
+    .filter((item) => item && typeof item.name === 'string' && item.name !== '')
+    .map((item) => ({ name: item.name, description: clipText(item.description, DESCRIPTION_LIMIT) }))
+  skills.sort((a, b) => a.name.localeCompare(b.name))
+  return { skills }
+}
+
 export function apply(ctx, config) {
   const requiredNow = () => readRequiredSkills([liveConfig(ctx), config])
 
@@ -262,6 +362,9 @@ export function apply(ctx, config) {
   })
 
   // 本插件**不注册任何工具**：解除门禁的唯一动作是成功的原生 `skill` 加载。
+
+  // 浏览器读 catalog 的只读路由：拿不到 webServer（非 web profile）时静默跳过。
+  installClientRoute(ctx)
 }
 
 export default { name, inject, apply, Config }

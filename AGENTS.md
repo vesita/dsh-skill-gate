@@ -36,8 +36,14 @@ dsh plugin --profile <profile> add "file:$DSH_HOME/packages/dsh-skill-gate-<vers
 - `src/client.ts` 全文件**不用 JSX**，只用 `require('react')` + `React.createElement`：
   自动 jsx runtime 从 `props.children` 取 children，与 `createElement` 的第三参数混用会静默渲染空元素。
   浏览器半边的加载协议是外层的 `__ModuleLoader__.load({ id, factory })` 包装，`id` 必须是包名。
+- 宿主半边另有一条只读路由 `GET /dsh-skill-gate/skill-index`（`src/index.ts` 的 `installClientRoute`）：
+  `ctx.inject(['webServer'], …)` 拿可选服务，拿不到（非 web profile）就静默跳过；拿不到 `connection`
+  时 fail-closed 不服务。载荷只有 skill 名字与截断后的描述，**不含路径、不含正文**。
+  路由行为由 `selfcheck.mjs` 第 10 节用假 webServer 钉住（不起浏览器也能验）。
 - 配置区注册在 `plugins.bundle.config`（key = 包名）与 `plugins.row.config`（key = `<包名>#<行 id>`）
   两处；保存/丢弃语义走官方 `SettingsFormModel` + `SettingsForm`，不要自己实现写回。
+  客户端的勾选态**派生**自字段草稿文本（点复选框 = `props.edit(FIELD, 新文本)`）；
+  路由读不到时退回文本框，**不许白屏**。
 - 判定语义、受保护工具名单与已知边界都写在 `README.md`；改行为就同步改它，别在两处各写一份。
 - 拒绝文案只引用配置里的名字与 `skill({ name: "…" })` 这种写法，**不要写死任何具体 skill 名**。
 - 往受保护名单里加名字之前先问一句：拦错了会不会挡住纯探查？加了就在 `selfcheck.mjs` 补对应断言。
