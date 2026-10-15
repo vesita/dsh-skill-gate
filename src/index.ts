@@ -1,18 +1,23 @@
 /**
- * dsh-skill-gate — 动手前的 skill 阅读门禁。
+ * dsh-skill-gate — 会话开始自动加载必读 skill（**不再拦截任何工具调用**）。
  *
- * 受保护的工具在调用前，本轮必须成功加载过 `requiredSkills` 里列出的每一份 skill：
- *   - `requiredSkills` 为空（默认）：**不拦** —— 没配必读名单时门禁不生效，直接放行；
- *   - `requiredSkills` 非空：名单里的**每一个**都要在本轮成功加载过，缺哪个就拒绝哪个。
+ * 第一次 `agent/pre-step` 时，把 `requiredSkills` 里的 skill 逐个**真执行一次加载**：
+ * `ctx.tools.execute({ name: 'skill', … })` 走完 `tools/pre-execute` → guards → 工具体 →
+ * `tools/post-execute` → `tools/result` 广播，再把返回的内容块作为**本步消息**注入。
+ *   - `requiredSkills` 为空（默认）：什么都不做 —— 没配名单 = 不生效；
+ *   - 非空：catalog 里有的逐个加载；不在 catalog 的忽略并出声；**一条都没成功也注入说明行**。
  *
- * 判定只认原生 `skill` 工具的成功调用（`tools/result` 且 `isError` 假）。
- * 本插件**不提供任何工具**：解除门禁的唯一动作是真的加载一份 skill，没有可以空手调用的
- * 「声明」接口。
+ * 「已加载」不是服务状态（`skills` 服务没有 isLoaded）：它就是**一次成功的 `skill` 工具执行**，
+ * 所以本插件保留 `tools/result` 观察者作为**只读观测**（记录「这个会话加载过哪些」并汇总一行日志），
+ * 而不是把同一条判定再实现一遍 —— 自动加载成立之后，拦截面（`tools/pre-execute` 守卫）已整体删除。
  *
- * 反死锁：配置里写了 catalog 里不存在的名字（skill 改名 / 删掉）时，这个名字本轮被忽略并记
- * 一行 warning；取不到 catalog（skills 服务缺席或调用失败）时保持严格。
+ * 本插件**不注册任何工具**：名单里的 skill 由本插件自己真执行加载，没有可以空手调用的「声明」接口。
+ *
+ * 反死锁：配置里写了 catalog 里不存在的名字（skill 改名 / 删掉）时忽略并记一行 warning；
+ * 取不到 catalog（skills 服务缺席或调用失败）时**不标记已加载、下一步重试**（读不到 ≠ 没有）。
  */
 
+import { randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import z from '@deepseek-ai/schemastery'
 
@@ -30,196 +35,62 @@ export const Config = z.object({
   requiredSkills: z.array(z.string()).default([]).volatile(),
 })
 
-/**
- * 受保护的工具：真正改变状态、且事后难挽回的那几个。
- * 往这个名单里加名字之前，先问一句：拦错了会不会挡住纯探查？
- */
-const GUARDED_TOOLS = new Set(['write', 'edit', 'plugin_manager'])
+/** 自动加载那次执行的 callId 前缀：与模型发起的调用可区分，日志里一眼可辨。 */
+const AUTOLOAD_CALL_PREFIX = 'skill-autoload:'
 
-/**
- * 会改状态的命令词。判据是**命令位置**：出现在行首、或 `;` `|` `&&` `||` `$(` 这类分隔符
- * 之后的那个词。同一个词出现在参数位置不算 —— `cat -n install.sh`、`grep -c dd f`、
- * `ls patch/` 都是纯读，否则每个任务开头都会撞门禁。
- *
- * 代价是判不了藏在参数里的写操作（`node -e '…writeFileSync…'`、`sh -c 'rm -rf x'`），
- * 见 README「已知边界」。
- */
-const WRITE_COMMANDS = new Set([
-  'tee',
-  'rm',
-  'mv',
-  'cp',
-  'mkdir',
-  'touch',
-  'truncate',
-  'dd',
-  'chmod',
-  'chown',
-  'ln',
-  'patch',
-  'install',
-  'sudo',
-])
+/** agentId -> 这个会话已经自动加载过。**只前进**（catalog 读不到是唯一的例外，见 pre-step）。 */
+const autoLoaded = new Set()
 
-/** 带上这些开关才算写的命令：`sed -i` / `sort -o` 落盘，`sed -n` / `sort -k` 只读。 */
-const WRITE_FLAGS = new Map([
-  ['sed', /^(-i|--in-place)/],
-  ['sort', /^(-o|--output)/],
-])
-
-const GIT_WRITE_SUBCOMMANDS = new Set([
-  'add',
-  'commit',
-  'push',
-  'reset',
-  'checkout',
-  'clean',
-  'rebase',
-  'merge',
-  'apply',
-  'stash',
-  'switch',
-  'restore',
-  'branch',
-  'rm',
-  'mv',
-  'cherry-pick',
-  'revert',
-])
-
-const PACKAGE_MANAGERS = new Set([
-  'systemctl',
-  'apt',
-  'apt-get',
-  'dpkg',
-  'pip',
-  'pipx',
-  'npm',
-  'pnpm',
-  'yarn',
-  'cargo',
-  'uv',
-])
-
-const PACKAGE_WRITE_SUBCOMMANDS = new Set([
-  'install',
-  'add',
-  'remove',
-  'uninstall',
-  'upgrade',
-  'update',
-  'publish',
-  'sync',
-])
-
-/** 真的写文件的输出重定向；`2>&1` / `>&2` 只是换文件描述符，不算。 */
-const WRITE_REDIRECT = /(^|[^<])>{1,2}(?!&)/
-
-/** 命令位置的分隔符。`(` `)` 与反引号一起切开，`$(rm -rf x)` 里的命令词也落到段首。 */
-const COMMAND_SEPARATOR = /\|\||&&|[;|&\n(){}`]/
-
-/** 命令前的噪声：shell 关键字与本身不改状态的包装命令。 */
-const COMMAND_PREFIX = new Set([
-  'command',
-  'builtin',
-  'exec',
-  'nohup',
-  'time',
-  'env',
-  'xargs',
-  'then',
-  'do',
-  'else',
-  'if',
-  'while',
-  'until',
-  '!',
-])
-
-/** `VAR=value` 形式的行内环境变量。 */
-const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/
-
-/** 按命令位置切段：每段至少一个词。 */
-function commandSegments(command: string): string[][] {
-  const segments: string[][] = []
-  for (const part of command.split(COMMAND_SEPARATOR)) {
-    const tokens = part.trim().split(/\s+/).filter(Boolean)
-    if (tokens.length > 0) segments.push(tokens)
-  }
-  return segments
-}
-
-/**
- * 段首的命令词：跳过 `VAR=value`、包装命令与开头的开关（命令词不会以 `-` 开头）。
- * 路径写成 `/usr/bin/rm` 时取 basename；`\rm` 这种转义别名也要认出来。
- */
-function commandWordOf(tokens: string[]): { word: string; args: string[] } | undefined {
-  let i = 0
-  while (
-    i < tokens.length &&
-    (ENV_ASSIGNMENT.test(tokens[i]) || COMMAND_PREFIX.has(tokens[i]) || tokens[i].startsWith('-'))
-  ) {
-    i++
-  }
-  if (i >= tokens.length) return undefined
-  const word = tokens[i].split('/').pop()!.replace(/^\\/, '')
-  return { word, args: tokens.slice(i + 1) }
-}
-
-/** 跳过 `git -C <dir>` 这类带值的开关，取子命令 —— 别把 `git log --grep add` 的 add 当成子命令。 */
-function gitSubcommand(args: string[]): string | undefined {
-  let i = 0
-  while (i < args.length && args[i].startsWith('-')) {
-    i += args[i] === '-C' || args[i] === '-c' ? 2 : 1
-  }
-  return args[i]
-}
-
-function firstNonFlag(args: string[]): string | undefined {
-  return args.find((token) => !token.startsWith('-'))
-}
-
-/**
- * bash 命令是否改状态。先抹掉空汇重定向（`/dev/null` 不改变状态），
- * 再看有没有非空汇重定向、或命令位置上的写命令词。
- */
-function bashLooksLikeWrite(command: string): boolean {
-  const text = command.replace(NULL_SINK, ' ')
-  if (WRITE_REDIRECT.test(text)) return true
-  for (const tokens of commandSegments(text)) {
-    const parsed = commandWordOf(tokens)
-    if (!parsed) continue
-    const { word, args } = parsed
-    if (WRITE_COMMANDS.has(word)) return true
-    if (word === 'git' && GIT_WRITE_SUBCOMMANDS.has(gitSubcommand(args) ?? '')) return true
-    if (PACKAGE_MANAGERS.has(word) && PACKAGE_WRITE_SUBCOMMANDS.has(firstNonFlag(args) ?? '')) return true
-    const flag = WRITE_FLAGS.get(word)
-    if (flag && args.some((token) => flag.test(token))) return true
-  }
-  return false
-}
-
-/** agentId -> 本轮成功加载过的 skill 名。 */
+/** agentId -> 本会话加载过的 skill 名。`tools/result` 只读观测的记录，也是日志汇总的来源。 */
 const loadedSkills = new Map()
 
-/** agentId -> 当前 turn。turn 一变就作废上一轮的判定。 */
-const turnOf = new Map()
+/** agentId -> 已经为「catalog 读不到」warn 过（不刷屏；**每一步仍会重试**）。 */
+const catalogWarned = new Set()
 
-/** agentId -> 本轮的 catalog 名字集合；null = 取不到 catalog（按严格处理）。 */
-const catalogOf = new Map()
+/** 宿主提供的官方构造函数 / 渲染器；缺失时走各自的失败路径，**绝不在本仓手抄副本**。 */
+interface HostHelpers {
+  createUserMessage?: (input: any) => any
+  renderSkillContent?: (skill: any) => string
+}
+
+function errorMessageOf(error) {
+  return String((error && error.message) || error)
+}
 
 /**
- * `>/dev/null` 是空汇：它不改变任何状态。判定前先把它当作空白抹掉，
- * 否则 `cmd 2>/dev/null`、`dsh --dump-config >/dev/null` 这类纯读取会被当成写操作拦住。
+ * 取宿主的官方 `createUserMessage` / `renderSkillContent`。
+ *
+ * **本插件不把 `@deepseek-ai/dsh-llm` / `dsh-skill` 写进 package.json**：它们由 dsh 本体提供，
+ * 从插件安装目录解析到的就是宿主那一份。两处 `import` 用**变量 specifier** 是刻意的：
+ * ① 本仓没有这两个包的类型，写字面量会让 `tsc` 直接 TS2307；
+ * ② 「拿不到」应当是运行期的失败路径，而不是编译期把依赖声明偷偷加进来。
+ * 手抄一份 `createUserMessage` / `renderSkillContent` 的副本是明确禁止的 —— 它会随上游
+ * 消息形状静默腐烂（判据与先例见 dsh-collab 的 AGENTS.md §1）。
  */
-const NULL_SINK = /(^|[^<])(?:\d?|&)>{1,2}\s*\/dev\/null\b/g
-
-function isGuarded(exec) {
-  if (GUARDED_TOOLS.has(exec.name)) return true
-  if (exec.name !== 'bash') return false
-  const command = exec.arguments?.command
-  if (typeof command !== 'string') return false
-  return bashLooksLikeWrite(command)
+async function resolveHostHelpers(deps: HostHelpers): Promise<HostHelpers> {
+  const helpers: HostHelpers = {
+    createUserMessage: deps.createUserMessage,
+    renderSkillContent: deps.renderSkillContent,
+  }
+  if (typeof helpers.createUserMessage !== 'function') {
+    try {
+      const spec = '@deepseek-ai/dsh-llm'
+      const mod: any = await import(spec)
+      if (typeof mod.createUserMessage === 'function') helpers.createUserMessage = mod.createUserMessage
+    } catch (error) {
+      // 交给调用方按「拿不到」处理（warn 一次 + 本会话不再重试）
+    }
+  }
+  if (typeof helpers.renderSkillContent !== 'function') {
+    try {
+      const spec = '@deepseek-ai/dsh-skill'
+      const mod: any = await import(spec)
+      if (typeof mod.renderSkillContent === 'function') helpers.renderSkillContent = mod.renderSkillContent
+    } catch (error) {
+      // 只在「skill 工具不可见」那条退化路径上才需要它
+    }
+  }
+  return helpers
 }
 
 /** 配置里可能存着一个 volatile 引用（`{ get() }`），也可能就是普通数组。 */
@@ -246,8 +117,7 @@ function normalizeNames(value) {
  * 坑：Cordis 的 ctx 是**代理**，未 inject 的属性不是 undefined 而是**抛错** ——
  * 直接写 `ctx.config` 会得到 `cannot get property "config" without inject`（`config` 不是服务，
  * 官方读法是 `apply(ctx, config)` 的那个参数，或 `<service>.config.<field>`）。
- * 那个错误在参数求值时就炸，`readRequiredSkills` 里的 try/catch 根本接不住，
- * 于是守卫与 pre-step 双双抛错 —— 写类工具与 plugin_manager 全被这个异常带走。
+ * 那个错误在参数求值时就炸，包住读取的 try/catch 根本接不住。
  * `ctx.get('config')` 是可选取用（拿不到给 undefined），迷你宿主把 config 挂成普通字段时才退回读属性。
  */
 function liveConfig(ctx) {
@@ -284,22 +154,30 @@ function readRequiredSkills(sources) {
 }
 
 /**
+ * 当前 workspace 的 cwd，拿不到就 undefined。
+ * `skill` 工具的 lookup 与只读路由共用这一份，别各写一遍。
+ */
+async function workingDirectoryOf(ctx, agent, signal) {
+  try {
+    const workingDirectory = ctx.get('workingDirectory')
+    if (workingDirectory && typeof workingDirectory.ensure === 'function') {
+      return await workingDirectory.ensure(agent, signal)
+    }
+  } catch (error) {
+    // 拿不到 cwd 是正常的退化（迷你宿主 / 还没落盘的工作目录）
+  }
+  return undefined
+}
+
+/**
  * best-effort 取一次当前 workspace 的 catalog 名字集合。
- * `skills` 是可选服务：缺席、拿不到 cwd、调用抛错都返回 null，由调用方按严格处理。
+ * `skills` 是可选服务：缺席、拿不到 cwd、调用抛错都返回 null —— 调用方据此**不标记、下一步重试**。
  */
 async function fetchCatalog(ctx, agent, signal) {
   try {
     const skills = ctx.get('skills')
     if (!skills || typeof skills.list !== 'function') return null
-    let cwd
-    try {
-      const workingDirectory = ctx.get('workingDirectory')
-      if (workingDirectory && typeof workingDirectory.ensure === 'function') {
-        cwd = await workingDirectory.ensure(agent, signal)
-      }
-    } catch {
-      cwd = undefined
-    }
+    const cwd = await workingDirectoryOf(ctx, agent, signal)
     const list = await skills.list({ cwd, scope: agent })
     if (!Array.isArray(list)) return null
     const names = new Set()
@@ -307,28 +185,87 @@ async function fetchCatalog(ctx, agent, signal) {
       if (item && typeof item.name === 'string' && item.name !== '') names.add(item.name)
     }
     return names
-  } catch {
+  } catch (error) {
     return null
+  }
+}
+
+/** 记一行 warning；同一个 agentId 上的同一类事只出声一次，别刷屏。 */
+function warnOnce(ctx, seen, id, message) {
+  if (seen.has(id)) return
+  seen.add(id)
+  try {
+    ctx.logger?.warn?.(`skill-gate: ${message}`)
+  } catch (error) {
+    // 记日志失败不影响加载
   }
 }
 
 function warnUnknown(ctx, names) {
   try {
     const message =
-      `skill-gate: requiredSkills 里的 ${names.join('、')} 不在当前 catalog 中，本轮忽略；` +
+      `skill-gate: requiredSkills 里的 ${names.join('、')} 不在当前 catalog 中，本次忽略；` +
       '请检查配置里的 skill 名是否已改名或删除。'
     ctx.logger?.warn?.(message)
-  } catch {
-    // 记日志失败不影响门禁
+  } catch (error) {
+    // 记日志失败不影响加载
   }
 }
 
-function denyMissing(toolName, missing) {
-  const calls = missing.map((item) => `skill({ name: "${item}" })`).join('、')
+/**
+ * 加载一份 skill，返回要注入的内容块（或失败原因）。
+ *
+ * **切到方案 B（不产生一次 out-of-band 工具执行）只改这一个函数**：删掉 `ctx.tools.execute`
+ * 那一段，直接走下面的「工具不可见」分支 —— 代价是 `tools/result` 观察者看不到这次加载。
+ */
+async function loadSkill(ctx, agent, signal, name, helpers: HostHelpers) {
+  const tools = ctx.tools
+  const skillTool = tools && typeof tools.get === 'function' ? tools.get('skill', agent) : undefined
+  if (skillTool !== undefined && typeof tools.execute === 'function') {
+    try {
+      const exec = await tools.execute({
+        callId: AUTOLOAD_CALL_PREFIX + randomUUID(),
+        name: 'skill',
+        arguments: { name },
+        agent,
+        signal,
+      })
+      if (exec && exec.isError !== true && Array.isArray(exec.content) && exec.content.length > 0) {
+        return { content: exec.content, via: 'tool' }
+      }
+      const reason = (exec && exec.error && exec.error.message) || '工具执行没有返回内容'
+      return { content: null, reason: String(reason) }
+    } catch (error) {
+      return { content: null, reason: errorMessageOf(error) }
+    }
+  }
+
+  // `skill` 工具在这个 scope 不可见（被 restrict，或这个 agent 跑在 PTC 模式）：直接读正文。
+  try {
+    const skills = ctx.get('skills')
+    if (!skills || typeof skills.get !== 'function') {
+      return { content: null, reason: '没有可用的 skills 服务，且 skill 工具不可见' }
+    }
+    const skill = await skills.get(name, {
+      cwd: await workingDirectoryOf(ctx, agent, signal),
+      scope: agent,
+      signal,
+    })
+    if (!skill) return { content: null, reason: '不在 catalog 或 provider 读不到' }
+    if (typeof helpers.renderSkillContent !== 'function') {
+      return { content: null, reason: '拿不到宿主的 renderSkillContent，无法渲染正文' }
+    }
+    return { content: [{ type: 'text', text: helpers.renderSkillContent(skill) }], via: 'service' }
+  } catch (error) {
+    return { content: null, reason: errorMessageOf(error) }
+  }
+}
+
+/** 加载不齐时注入的说明行：**一条都没成功也要有它**，否则会让人以为已经自动加载过了。 */
+function autoloadNoteText(missing) {
   return (
-    `${toolName} 被 skill-gate 拦下：本轮还没成功加载过必读 skill：${missing.join('、')}。` +
-    `请先逐个调用 ${calls} 并加载成功。` +
-    '只读工具（read / grep / glob 等）与只读 bash 不受限制。'
+    '<skill_autoload>必读 skill 未能全部加载：' + missing.join('；') + '。' +
+    '不要假定这些纪律已在上下文中；需要时用 `skill` 工具显式加载。</skill_autoload>'
   )
 }
 
@@ -390,7 +327,7 @@ function resolveAgent(ctx, sessionId: string | undefined) {
  * 拿不到 `connection` 时 fail-closed 不服务。
  *
  * **列 catalog 的视角必须与原生 `skill` 工具一致**：文件型 provider（`~/.dsh/skills`、项目级）
- * 挂在**按 agent 的 scope 层**里，`skills.list({})` 只会看到全局层（插件运行时注册的那几份）。
+ * 挂在**按 agent 的 scope** 层里，`skills.list({})` 只会看到全局层（插件运行时注册的那几份）。
  * 所以这里 `?session=` → `agents.get` / `roots()[0]` / `list()[0]` / `currentInitiator()` 选一个
  * agent 当 `scope`，cwd 走 `workingDirectory.ensure`；选不到 agent 才退回 `list({})`，并在载荷里
  * 标 `partial: true` + `reason`，让客户端显示警示而不是假装列表是全的。
@@ -442,16 +379,7 @@ function installClientRoute(ctx) {
           // 不带 scope 就只剩全局层。选不到 agent 才退回全局层，并把这件事标进载荷。
           const agent = resolveAgent(ctx, sessionIdFromUrl(req.url))
           const lookup: any = { cwd: undefined, signal: undefined, scope: agent }
-          if (agent) {
-            try {
-              const workingDirectory = ctx.get('workingDirectory')
-              if (workingDirectory && typeof workingDirectory.ensure === 'function') {
-                lookup.cwd = await workingDirectory.ensure(agent, undefined)
-              }
-            } catch (e) {
-              lookup.cwd = undefined
-            }
-          }
+          if (agent) lookup.cwd = await workingDirectoryOf(ctx, agent, undefined)
           let list
           try {
             list = await (agent ? skills.list(lookup) : skills.list({}))
@@ -501,33 +429,87 @@ export function buildSkillIndex(list: unknown): { skills: Array<{ name: string; 
   return { skills }
 }
 
-export function apply(ctx, config) {
+/**
+ * @param ctx - host 上下文（`tools` 是硬依赖，`skills` / `workingDirectory` / `logger` / `webServer` 都可选）。
+ * @param config - Loader 投影出来的条目配置。
+ * @param deps - 宿主的官方构造器注入点（自检用）；生产留空，由 `resolveHostHelpers` 现读。
+ */
+export function apply(ctx, config, deps: HostHelpers = {}) {
   const requiredNow = () => readRequiredSkills([liveConfig(ctx), config])
+  const helpersPromise = resolveHostHelpers(deps)
 
-  // 换 turn 就作废上一轮的判定：粒度是「一轮一次」，不是「一会话一次」。
-  // agent/pre-step 是 waterfall —— 观察者只记录，决策必须原样交回去。
+  // 会话开始自动加载：`agent/pre-step` 的**首次触发**是唯一能赶在第一条模型请求前
+  // 把消息放进本步输入的缝。waterfall —— 决策必须原样交回，只允许往后追加消息。
   ctx.on('agent/pre-step', async (payload, next) => {
-    const id = payload?.agent?.id
-    if (id !== undefined && turnOf.get(id) !== payload?.turn) {
-      turnOf.set(id, payload?.turn)
-      loadedSkills.delete(id)
-      catalogOf.delete(id)
+    const decision = await next()
+    if (!decision || decision.kind === 'reject') return decision
 
-      const required = requiredNow()
-      if (required.length > 0) {
-        const catalog = await fetchCatalog(ctx, payload.agent, payload?.signal)
-        catalogOf.set(id, catalog)
-        if (catalog) {
-          const unknown = required.filter((item) => !catalog.has(item))
-          if (unknown.length > 0) warnUnknown(ctx, unknown)
-        }
-      }
+    const agent = payload?.agent
+    const id = agent?.id
+    if (id === undefined) return decision // 无会话身份：不做事
+    if (autoLoaded.has(id)) return decision // 会话一次
+
+    const required = requiredNow()
+    if (required.length === 0) return decision // 没配名单 = 不生效
+
+    // 拿不到宿主的消息构造器就没有交付面：出声一次、本会话不再重试（否则每步都会重复执行加载）。
+    const helpers = await helpersPromise
+    if (typeof helpers.createUserMessage !== 'function') {
+      autoLoaded.add(id)
+      warnOnce(ctx, catalogWarned, id, '拿不到宿主的 createUserMessage，无法注入必读 skill 正文；本次不自动加载')
+      return decision
     }
-    return next()
+
+    const catalog = await fetchCatalog(ctx, agent, payload?.signal)
+    if (catalog === null) {
+      // 读不到 ≠ 没有：**不标记**，下一步重试（catalog 往往只是还没就绪）。
+      warnOnce(ctx, catalogWarned, id, '取不到 skill catalog，本次不自动加载，下一步重试')
+      return decision
+    }
+
+    const unknown = required.filter((item) => !catalog.has(item))
+    if (unknown.length > 0) warnUnknown(ctx, unknown)
+
+    const messages = []
+    const missing = unknown.map((item) => `${item}（不在当前 catalog）`)
+    for (const skillName of required) {
+      if (!catalog.has(skillName)) continue
+      const loaded = await loadSkill(ctx, agent, payload?.signal, skillName, helpers)
+      if (loaded.content === null) {
+        missing.push(`${skillName}（${loaded.reason}）`)
+        continue
+      }
+      messages.push(helpers.createUserMessage({
+        content: loaded.content,
+        source: { kind: 'skill-autoload', name: skillName, form: 'instructions' },
+      }))
+    }
+
+    // 一条都没成功也要注入说明行：否则「配了名单」看起来就像「已经加载过了」。
+    if (missing.length > 0) {
+      const text = autoloadNoteText(missing)
+      messages.push(helpers.createUserMessage({
+        content: [{ type: 'text', text }],
+        source: { kind: 'skill-autoload', name: '*', form: 'notice', summary: clipText(text, 120) },
+      }))
+    }
+
+    autoLoaded.add(id)
+    try {
+      const recorded = loadedSkills.get(id)
+      ctx.logger?.info?.(
+        'skill-gate: 会话开始自动加载 —— 已加载 ' + (recorded ? [...recorded].join('、') : '无') +
+        (missing.length > 0 ? `；未加载 ${missing.join('；')}` : ''),
+      )
+    } catch (error) {
+      // 日志失败不影响注入
+    }
+    if (messages.length === 0) return decision
+    return { ...decision, messages: [...decision.messages, ...messages] }
   })
 
-  // 观察成功的 skill 加载，记名。tools/result 是只读广播，不改结果本身。
-  // 只有原生的 `skill` 工具算数：失败的加载（isError）不算，插件也不提供任何「声明」工具。
+  // 只读观测：记下这个会话加载过哪些 skill（自动加载的那次执行同样会经过这里 —— `tools/result`
+  // 是 execute 的最后一站）。它**不参与任何判定**，只用来汇总日志、供后续消费者读。
   ctx.on('tools/result', (exec, result) => {
     if (!result || result.isError) return
     if (!exec || exec.name !== 'skill') return
@@ -547,33 +529,13 @@ export function apply(ctx, config) {
   ctx.on('agent/disposed', ({ agent }) => {
     const id = agent?.id
     if (id === undefined) return
+    autoLoaded.delete(id)
     loadedSkills.delete(id)
-    turnOf.delete(id)
-    catalogOf.delete(id)
+    catalogWarned.delete(id)
   })
 
-  // 门禁：同步、与其它 guard 的注册顺序无关
-  ctx.tools.guard((exec) => {
-    const id = exec.agent?.id
-    if (id === undefined) return undefined // 无会话身份，不拦
-    if (!isGuarded(exec)) return undefined
-
-    // 没配必读名单 = 门禁不生效：直接放行。
-    // （判定看的是「必读名单读全了没有」，不是「有没有加载过 skill」——后者是旧语义，已去掉。）
-    const required = requiredNow()
-    if (required.length === 0) return undefined
-
-    // 非空名单：catalog 在场的名字逐个要求加载过；不在场的名字本轮忽略（反死锁）。
-    // catalog 取不到（catalogOf 缺项或为 null）时保持严格；名单全不在场则本轮不锁死。
-    const catalog = catalogOf.get(id)
-    const effective = catalog instanceof Set ? required.filter((item) => catalog.has(item)) : required
-    if (effective.length === 0) return undefined
-    const loaded = loadedSkills.get(id)
-    const missing = effective.filter((item) => !loaded || !loaded.has(item))
-    return missing.length === 0 ? undefined : denyMissing(exec.name, missing)
-  })
-
-  // 本插件**不注册任何工具**：解除门禁的唯一动作是成功的原生 `skill` 加载。
+  // 本插件**不拦任何工具调用**（守卫已删除：自动加载成立之后，同一条判定不再有第二处实现），
+  // 也**不注册任何工具**：名单里的 skill 由上面的 pre-step 自己执行加载。
 
   // 浏览器读 catalog 的只读路由：拿不到 webServer（非 web profile）时静默跳过。
   installClientRoute(ctx)

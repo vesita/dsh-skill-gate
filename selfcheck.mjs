@@ -1,6 +1,9 @@
 // dsh-skill-gate 的判定逻辑自检：不依赖 dsh 运行时，用假 ctx 喂事件，逐条断言。
 // 判据是**构建产物**（`lib/index.js`），不是源码 —— 发布出去的就是它。
 // 先 `pnpm run build`（`pnpm test` 已经带上了），退出码即判据：0 = 全过。
+//
+// 本插件现在的语义是「会话开始自动执行加载」，所以假 ctx 必须提供 `tools.execute`
+// （并在返回前像真注册表那样广播一次 `tools/result`）：那是自动加载的**唯一**交付面。
 import assert from 'node:assert/strict'
 import plugin, { apply, Config } from './lib/index.js'
 
@@ -11,23 +14,47 @@ function ok(cond, label) {
   console.log('  ok  ' + label)
 }
 
-/** 假 ctx：手写 on / tools.guard / tools.register / get / logger / inject，config 可在运行中替换。
+let msgSeq = 0 /** 假的消息构造器：只为断言看得见 id 递增。 */
+const createUserMessage = (input) => ({ ...input, id: `msg-${++msgSeq}`, role: 'user' })
+const renderSkillContent = (skill) => `<skill_content name="${skill.name}">${skill.content}</skill_content>`
+
+/** 假 ctx：手写 on / tools / get / logger / inject，config 可在运行中替换。
  *  `configThrows` 复刻 Cordis 代理的行为：未 inject 的属性**抛错**，不是 undefined。 */
 function makeCtx(opts = {}) {
   const handlers = new Map()
   const registered = []
   const warnings = []
+  const infos = []
   const injects = []
+  const executed = []
+  let guardRegistered = false
   const services = opts.services ?? {}
-  let guardFn = null
   const ctx = {
     on(event, fn) { handlers.set(event, fn) },
     get(name) { return services[name] },
     inject(names, callback) { injects.push({ names, callback }); return () => {} },
-    logger: { warn: (m) => { warnings.push(String(m)) }, info() {}, error() {} },
+    logger: {
+      warn: (m) => { warnings.push(String(m)) },
+      info: (m) => { infos.push(String(m)) },
+      error() {},
+    },
     tools: {
-      guard(fn) { guardFn = fn },
+      guard() { guardRegistered = true },
       register(def) { registered.push(def) },
+      // 自动加载先问「这个 scope 里 skill 工具可不可见」；`skillToolVisible: false` 复刻被 restrict 的现场。
+      get(name) { return opts.skillToolVisible === false ? undefined : { name } },
+      async execute(input) {
+        executed.push(input)
+        const result = opts.executeResult
+          ? opts.executeResult(input)
+          : { isError: false, content: [{ type: 'text', text: `<skill_content name="${input.arguments.name}">body</skill_content>` }] }
+        // 真注册表 execute 的最后一站就是 tools/result 广播（dsh-tools 的 notifyResult）。
+        const notify = handlers.get('tools/result')
+        if (typeof notify === 'function') {
+          notify({ name: input.name, agent: input.agent, arguments: input.arguments }, result)
+        }
+        return result
+      },
     },
   }
   if (opts.configThrows) {
@@ -37,21 +64,25 @@ function makeCtx(opts = {}) {
   } else {
     ctx.config = opts.config
   }
-  apply(ctx, opts.applyConfig)
+  // 消息构造器由宿主提供（见 src/index.ts 的 resolveHostHelpers）：自检把它当依赖注入。
+  // `opts.hostDeps === false` 时不注入 —— 复刻「宿主里拿不到官方构造器」的现场。
+  const deps = opts.hostDeps === false ? {} : { createUserMessage, renderSkillContent, ...(opts.hostDeps ?? {}) }
+  apply(ctx, opts.applyConfig, deps)
   return {
     ctx,
     registered,
     warnings,
+    infos,
     injects,
-    guard: (exec) => guardFn(exec),
-    step: (agent, turn) =>
-      handlers.get('agent/pre-step')({ agent, turn, signal: undefined }, async () => ({ kind: 'enter', messages: [] })),
+    executed,
+    hasGuard: () => guardRegistered,
+    step: (agent, turn = 1, decision = { kind: 'enter', messages: [] }) =>
+      handlers.get('agent/pre-step')({ agent, turn, step: 1, signal: undefined }, async () => decision),
     result: (agent, skillName, isError = false) =>
       handlers.get('tools/result')({ name: 'skill', agent, arguments: { name: skillName } }, { isError }),
     resultVia: (agent, toolName, args = {}) =>
       handlers.get('tools/result')({ name: toolName, agent, arguments: args }, { isError: false }),
     dispose: (agent) => handlers.get('agent/disposed')({ agent }),
-    hasGuard: () => typeof guardFn === 'function',
   }
 }
 
@@ -68,8 +99,11 @@ const H = { id: 'agent-H' }
 const I = { id: 'agent-I' }
 const J = { id: 'agent-J' }
 const K = { id: 'agent-K' }
-const L = { id: 'agent-L' }
-const M = { id: 'agent-M' }
+const N = { id: 'agent-N' }
+const O = { id: 'agent-O' }
+const P = { id: 'agent-P' }
+const Q = { id: 'agent-Q' }
+const R = { id: 'agent-R' }
 
 const allCtxs = []
 function ctxOf(opts) {
@@ -89,186 +123,182 @@ ok(Array.isArray(plugin.inject) && plugin.inject.join(',') === 'tools', "inject 
   ok(Array.isArray(value) && value.length === 0, 'Config 默认 requiredSkills 为 []')
 }
 
-console.log('# 1. 默认（requiredSkills: []）：不拦 —— 没配必读名单时门禁不生效')
+console.log('# 1. 默认（requiredSkills: []）：什么都不做 —— 没配名单就不生效')
 {
   const h = ctxOf({ config: { requiredSkills: [] } })
-  ok(h.hasGuard(), '注册了 tools.guard')
   await h.step(A, 1)
-  ok(h.guard({ name: 'write', agent: A, arguments: {} }) === undefined, '1. 空名单：write 放行')
-  ok(h.guard({ name: 'edit', agent: A, arguments: {} }) === undefined, '1. 空名单：edit 放行')
-  ok(h.guard({ name: 'plugin_manager', agent: A, arguments: {} }) === undefined, '1. 空名单：plugin_manager 放行')
-  ok(
-    h.guard({ name: 'bash', agent: A, arguments: { command: 'echo x > /tmp/f' } }) === undefined,
-    '1. 空名单：写 bash 也放行',
-  )
-  h.result(A, 'any-skill')
-  ok(h.guard({ name: 'write', agent: A, arguments: {} }) === undefined, '1. 空名单：加载与否都不拦')
+  ok(h.executed.length === 0, '1. 空名单：一次 tools.execute 都没有')
+  ok(h.infos.length === 0, '1. 空名单：不记自动加载日志')
 }
 
-console.log('# 2. 只读不误伤（配了必读名单，所以「放行」是真的判定结果，不是空名单放行）')
-{
-  const h = ctxOf({ config: { requiredSkills: ['a'] }, services: { skills: catalog('a') } })
-  await h.step(B, 1)
-  ok(h.guard({ name: 'read', agent: B, arguments: {} }) === undefined, '2. read 放行')
-  ok(h.guard({ name: 'grep', agent: B, arguments: {} }) === undefined, '2. grep 放行')
-  ok(h.guard({ name: 'glob', agent: B, arguments: {} }) === undefined, '2. glob 放行')
-  ok(h.guard({ name: 'skill', agent: B, arguments: {} }) === undefined, '2. skill 自身放行')
-  ok(
-    h.guard({ name: 'bash', agent: B, arguments: { command: 'ls -la /tmp && git status --short' } }) === undefined,
-    '2. 只读 bash 放行',
-  )
-  ok(
-    h.guard({ name: 'bash', agent: B, arguments: { command: 'head -5 f 2>&1' } }) === undefined,
-    '2. 2>&1 重定向不算写',
-  )
-  // 空汇重定向：`>/dev/null` 不改变状态，别当成写（否则纯读取的命令被拦，正是门禁自己的承诺）
-  ok(
-    h.guard({ name: 'bash', agent: B, arguments: { command: 'dsh --profile web --dump-config >/dev/null 2>&1' } }) ===
-      undefined,
-    '2. >/dev/null 不算写',
-  )
-  ok(
-    h.guard({ name: 'bash', agent: B, arguments: { command: 'grep -n x f 2>/dev/null' } }) === undefined,
-    '2. 2>/dev/null 不算写',
-  )
-  ok(
-    h.guard({ name: 'bash', agent: B, arguments: { command: 'cmd &>/dev/null' } }) === undefined,
-    '2. &>/dev/null 不算写',
-  )
-  ok(
-    typeof h.guard({ name: 'bash', agent: B, arguments: { command: 'cmd >> out.txt' } }) === 'string',
-    '2. 写真实文件仍拦',
-  )
-  ok(
-    typeof h.guard({ name: 'bash', agent: B, arguments: { command: 'cmd >/dev/null; rm -rf /tmp/x' } }) === 'string',
-    '2. /dev/null 后面还有写操作，整体仍拦',
-  )
-  ok(h.guard({ name: 'write', arguments: {} }) === undefined, '2. 无 agent 身份不拦')
-}
-
-console.log("# 3. requiredSkills: ['a','b']：逐个加载才放行")
+console.log('# 2. 首次 agent/pre-step：名单里 catalog 有的逐个**真执行**一次加载，正文进本步消息')
 {
   const h = ctxOf({ config: { requiredSkills: ['a', 'b'] }, services: { skills: catalog('a', 'b') } })
+  const decision = await h.step(B, 1)
+  ok(h.executed.length === 2, '2. execute 恰好 N 次（N = 名单 ∩ catalog = 2）')
+  ok(h.executed.every((e) => e.name === 'skill'), "2. 执行的都是 skill 工具")
+  ok(h.executed.every((e) => typeof e.callId === 'string' && e.callId.startsWith('skill-autoload:')),
+    '2. callId 带可区分的 skill-autoload: 前缀')
+  ok(h.executed.map((e) => e.arguments.name).join(',') === 'a,b', '2. 逐个按名单顺序执行')
+  ok(decision.kind === 'enter' && decision.messages.length === 2, '2. 本步消息里多出 2 条注入')
+  ok(decision.messages.every((m) => m.role === 'user' && m.source.kind === 'skill-autoload'),
+    "2. 注入消息 role=user 且 source.kind='skill-autoload'")
+  ok(decision.messages.map((m) => m.source.name).join(',') === 'a,b', '2. 每条注入点名它加载的 skill')
+  ok(decision.messages[0].content[0].text.includes('<skill_content name="a">'), '2. 注入的是工具执行返回的正文')
+  ok(h.infos.length === 1 && h.infos[0].includes('已加载 a、b'), '2. 只读观测汇总成一行 info 日志')
+}
+
+console.log('# 3. 会话一次：第二次 pre-step 不再执行')
+{
+  const h = ctxOf({ config: { requiredSkills: ['a'] }, services: { skills: catalog('a') } })
   await h.step(C, 1)
-  const first = h.guard({ name: 'write', agent: C, arguments: {} })
-  ok(typeof first === 'string' && first.includes('a') && first.includes('b'), '3. 一个都没加载时点名 a 与 b')
-  ok(first.includes('skill({ name: "a" })') && first.includes('skill({ name: "b" })'), '3. 拒绝文案给出逐个加载的下一步')
-  h.result(C, 'a')
-  const second = h.guard({ name: 'write', agent: C, arguments: {} })
-  ok(typeof second === 'string' && second.includes('b') && !second.includes('"a"'), '3. 只加载 a 后仍拒，且只点名缺的 b')
-  h.result(C, 'b')
-  ok(h.guard({ name: 'write', agent: C, arguments: {} }) === undefined, '3. a + b 都加载后放行')
-
-  await h.step(D, 1)
-  h.result(D, 'b')
-  const onlyB = h.guard({ name: 'write', agent: D, arguments: {} })
-  ok(typeof onlyB === 'string' && onlyB.includes('"a"'), '3. 只加载 b 不认，仍点名 a')
+  const second = await h.step(C, 2)
+  ok(h.executed.length === 1, '3. 第二个 pre-step 不再 execute')
+  ok(second.messages.length === 0, '3. 第二个 pre-step 不再注入')
 }
 
-console.log('# 4. 失败的加载不算数')
-{
-  const h2 = ctxOf({ config: { requiredSkills: ['a'] }, services: { skills: catalog('a') } })
-  await h2.step(F, 1)
-  h2.result(F, 'a', true)
-  ok(typeof h2.guard({ name: 'write', agent: F, arguments: {} }) === 'string', '4. 必读名单里的失败加载不算数')
-  h2.result(F, 'a')
-  ok(h2.guard({ name: 'write', agent: F, arguments: {} }) === undefined, '4. 随后成功加载才放行')
-
-  const h3 = ctxOf({ config: { requiredSkills: ['a'] }, services: { skills: catalog('a') } })
-  await h3.step(E, 1)
-  h3.resultVia(E, 'read')
-  ok(typeof h3.guard({ name: 'write', agent: E, arguments: {} }) === 'string', '4. 别的工具的成功结果不算数')
-  h3.result(E, 'b')
-  ok(typeof h3.guard({ name: 'write', agent: E, arguments: {} }) === 'string', '4. 加载名单外的 skill 也不算数')
-}
-
-console.log('# 5. 换 turn 重置 + agent/disposed 回收（必读名单每轮重新要求）')
-{
-  const h = ctxOf({ config: { requiredSkills: ['x'] }, services: { skills: catalog('x') } })
-  await h.step(G, 1)
-  h.result(G, 'x')
-  ok(h.guard({ name: 'write', agent: G, arguments: {} }) === undefined, '5. turn 1 加载必读后放行')
-  await h.step(G, 2)
-  ok(typeof h.guard({ name: 'write', agent: G, arguments: {} }) === 'string', '5. 新 turn 重新要求必读')
-  h.result(G, 'y')
-  ok(typeof h.guard({ name: 'write', agent: G, arguments: {} }) === 'string', '5. 新 turn 加载名单外的 skill 不放行')
-  h.result(G, 'x')
-  ok(h.guard({ name: 'write', agent: G, arguments: {} }) === undefined, '5. 新 turn 再加载必读后放行')
-  h.dispose(G)
-  await h.step(G, 3)
-  ok(typeof h.guard({ name: 'write', agent: G, arguments: {} }) === 'string', '5. 回收后新 turn 仍要重新加载')
-}
-
-console.log('# 6. 软化：catalog 里没有的必读名本轮忽略；取不到 catalog 时严格')
+console.log('# 4. 名单里 catalog 没有的名字：不执行它 + 说明行点名')
 {
   const h = ctxOf({ config: { requiredSkills: ['a', 'b'] }, services: { skills: catalog('a') } })
-  await h.step(H, 1)
-  ok(h.warnings.length === 1 && h.warnings[0].includes('b'), '6. catalog 里没有 b：记一行 warning')
-  h.result(H, 'a')
-  ok(h.guard({ name: 'write', agent: H, arguments: {} }) === undefined, '6. 只加载 a 就放行（b 被忽略）')
-
-  const strict = ctxOf({ config: { requiredSkills: ['a', 'b'] }, services: {} })
-  await strict.step(I, 1)
-  strict.result(I, 'a')
-  const stillDenied = strict.guard({ name: 'write', agent: I, arguments: {} })
-  ok(typeof stillDenied === 'string' && stillDenied.includes('"b"'), '6. skills 服务缺失：保持严格，仍拒')
-  strict.result(I, 'b')
-  ok(strict.guard({ name: 'write', agent: I, arguments: {} }) === undefined, '6. 服务缺失时两个都加载才放行')
-
-  const throwing = ctxOf({
-    config: { requiredSkills: ['a', 'b'] },
-    services: { skills: { list: async () => { throw new Error('boom') } } },
-  })
-  await throwing.step(J, 1)
-  throwing.result(J, 'a')
-  ok(typeof throwing.guard({ name: 'write', agent: J, arguments: {} }) === 'string', '6. list 抛错：按取不到 catalog 处理，保持严格')
-
-  const nullish = ctxOf({ config: { requiredSkills: ['a', 'b'] }, services: { skills: { list: async () => null } } })
-  await nullish.step(K, 1)
-  ok(typeof nullish.guard({ name: 'write', agent: K, arguments: {} }) === 'string', '6. list 返回非数组：保持严格')
-
-  const allUnknown = ctxOf({ config: { requiredSkills: ['zzz'] }, services: { skills: catalog('a') } })
-  await allUnknown.step(L, 1)
-  ok(allUnknown.guard({ name: 'write', agent: L, arguments: {} }) === undefined, '6. 名单里的名字全不在 catalog：本轮不锁死')
+  const decision = await h.step(D, 1)
+  ok(h.executed.length === 1 && h.executed[0].arguments.name === 'a', '4. 只执行 catalog 里有的 a')
+  ok(h.warnings.some((w) => w.includes('b')), '4. 不在 catalog 的 b 记一行 warning')
+  const note = decision.messages.find((m) => m.source.form === 'notice')
+  ok(note !== undefined && note.content[0].text.includes('b'), '4. 说明行点名 b')
+  ok(note.content[0].text.includes('skill_autoload'), '4. 说明行可辨（skill_autoload 标记）')
 }
 
-console.log('# 7. 宿主把 config 读成抛错（Cordis 代理）时，守卫与 pre-step 都不炸')
+console.log('# 5. 一条都没成功也注入说明行（不许让人以为已经加载过）')
 {
-  // 真宿主：`ctx.config` 不是 undefined 而是抛 `cannot get property "config" without inject`，
-  // 只有 `apply(ctx, config)` 的那份配置可用。
+  const h = ctxOf({ config: { requiredSkills: ['zzz'] }, services: { skills: catalog('a') } })
+  const decision = await h.step(E, 1)
+  ok(h.executed.length === 0, '5. 全不在 catalog：一次也不执行')
+  ok(decision.messages.length === 1 && decision.messages[0].source.form === 'notice',
+    '5. 仍然注入恰好一条说明行')
+  ok(decision.messages[0].content[0].text.includes('zzz'), '5. 说明行点名 zzz')
+}
+
+console.log('# 6. 执行失败（isError）不算成功：正文不注入，进说明行')
+{
   const h = ctxOf({
-    configThrows: true,
-    applyConfig: { requiredSkills: ['a', 'b'] },
-    services: { skills: catalog('a', 'b') },
+    config: { requiredSkills: ['a'] },
+    services: { skills: catalog('a') },
+    executeResult: () => ({ isError: true, error: { message: '被别的守卫拒了' } }),
   })
-  let stepError = null
-  try {
-    await h.step(M, 1)
-  } catch (e) {
-    stepError = e
-  }
-  ok(stepError === null, '7. agent/pre-step 现读配置不抛错')
-  const denied = h.guard({ name: 'plugin_manager', agent: M, arguments: {} })
-  ok(typeof denied === 'string', '7. plugin_manager 仍给出判定，而不是被异常带走')
-  ok(denied.includes('"a"') && denied.includes('"b"'), '7. 兜底读 apply(ctx, config) 的名单，点名 a 与 b')
-  h.result(M, 'a')
-  h.result(M, 'b')
-  ok(h.guard({ name: 'write', agent: M, arguments: {} }) === undefined, '7. 两名字加载齐全后放行')
+  const decision = await h.step(F, 1)
+  ok(h.executed.length === 1, '6. 仍然尝试执行了一次')
+  ok(decision.messages.length === 1 && decision.messages[0].source.form === 'notice', '6. 只有说明行，没有正文')
+  ok(decision.messages[0].content[0].text.includes('被别的守卫拒了'), '6. 说明行带上失败原因')
 }
 
-console.log('# 8. 插件不注册任何工具')
-ok(allCtxs.every((h) => h.registered.length === 0), '8. tools.register 零调用')
-
-console.log('# 9. agent/pre-step 决策原样交回')
+console.log('# 7. skill 工具在该 scope 不可见：退回 skills.get + renderSkillContent')
 {
-  const h = ctxOf({ config: { requiredSkills: [] } })
-  const handlers = h
-  const decision = await handlers.step(A, 9)
-  assert.deepEqual(decision, { kind: 'enter', messages: [] })
-  ok(true, '9. waterfall 决策逐字段原样交回')
+  const h = ctxOf({
+    config: { requiredSkills: ['a'] },
+    skillToolVisible: false,
+    services: { skills: { list: async () => [{ name: 'a' }], get: async (name) => ({ name, content: '正文' }) } },
+  })
+  const decision = await h.step(G, 1)
+  ok(h.executed.length === 0, '7. 工具不可见时不做注定 UNKNOWN_TOOL 的执行')
+  ok(decision.messages.length === 1 && decision.messages[0].source.kind === 'skill-autoload',
+    '7. 仍然注入正文（走 service）')
+  ok(decision.messages[0].content[0].text === '<skill_content name="a">正文</skill_content>',
+    '7. 用的是宿主的 renderSkillContent')
+
+  const noRenderer = ctxOf({
+    config: { requiredSkills: ['a'] },
+    hostDeps: { renderSkillContent: undefined },
+    skillToolVisible: false,
+    services: { skills: { list: async () => [{ name: 'a' }], get: async (name) => ({ name, content: '正文' }) } },
+  })
+  const fallback = await noRenderer.step(H, 1)
+  ok(fallback.messages.length === 1 && fallback.messages[0].source.form === 'notice',
+    '7. 拿不到 renderSkillContent 时如实进说明行，不伪造正文')
 }
 
-console.log('# 10. 宿主只读路由：不起浏览器也能验注册与返回形状')
+console.log('# 8. catalog 读不到：**不标记**、下一步重试（读不到 ≠ 没有）')
+{
+  let attempts = 0
+  const flaky = {
+    list: async () => {
+      attempts += 1
+      if (attempts === 1) throw new Error('catalog 还没就绪')
+      return [{ name: 'a' }]
+    },
+  }
+  const h = ctxOf({ config: { requiredSkills: ['a'] }, services: { skills: flaky } })
+  const first = await h.step(I, 1)
+  ok(h.executed.length === 0 && first.messages.length === 0, '8. 第一次读不到：不执行、不注入')
+  ok(h.warnings.some((w) => w.includes('下一步重试')), '8. 出声说明会重试')
+  const second = await h.step(I, 2)
+  ok(h.executed.length === 1, '8. 第二次 pre-step 真的重试并加载成功')
+  ok(second.messages.length === 1, '8. 第二次注入正文')
+  ok(h.warnings.filter((w) => w.includes('下一步重试')).length === 1, '8. 重试提示不刷屏（同 agent 只出声一次）')
+
+  const missing = ctxOf({ config: { requiredSkills: ['a'] }, services: {} })
+  await missing.step(J, 1)
+  await missing.step(J, 2)
+  ok(missing.executed.length === 0 && missing.warnings.length === 1, '8. skills 服务缺席：每步重试但不刷屏')
+}
+
+console.log('# 9. 拿不到宿主的 createUserMessage：出声一次、不执行、不抛')
+{
+  const h = ctxOf({ config: { requiredSkills: ['a'] }, hostDeps: false, services: { skills: catalog('a') } })
+  let threw = null
+  try {
+    await h.step(K, 1)
+  } catch (e) {
+    threw = e
+  }
+  ok(threw === null, '9. 不抛穿')
+  ok(h.executed.length === 0, '9. 没有交付面就不做执行（避免每步重复执行）')
+  ok(h.warnings.length === 1 && h.warnings[0].includes('createUserMessage'), '9. 出声一次点名原因')
+  await h.step(K, 2)
+  ok(h.warnings.length === 1, '9. 本会话不再重复出声')
+}
+
+console.log('# 10. 无会话身份 / 只读观测不触发执行 / dispose 回收')
+{
+  const h = ctxOf({ config: { requiredSkills: ['a'] }, services: { skills: catalog('a') } })
+  await h.step({}, 1)
+  ok(h.executed.length === 0, '10. 没有 agent.id：不做事')
+
+  // 模型自己加载过的 skill：只落进只读观测，不会让插件再执行一次。
+  h.result(O, 'x')
+  ok(h.executed.length === 0, '10. 只读观测不触发执行')
+
+  await h.step(N, 1)
+  ok(h.executed.length === 1, '10. 新会话照常自动加载一次')
+  await h.step(N, 2)
+  ok(h.executed.length === 1, '10. 同一会话第二次不重复')
+  h.dispose(N)
+  await h.step(N, 3)
+  ok(h.executed.length === 2, '10. dispose 回收标记后重新加载一趟')
+}
+
+console.log('# 11. 本插件不注册工具、不注册 guard（拦截面整体删除）')
+ok(allCtxs.every((h) => h.registered.length === 0), '11. tools.register 零调用')
+ok(allCtxs.every((h) => h.hasGuard() === false), '11. tools.guard 零调用')
+{
+  const h = ctxOf({ config: { requiredSkills: ['a'] }, services: { skills: catalog('a') } })
+  await h.step(P, 7)
+  ok(h.executed.length === 1 && h.executed[0].name === 'skill', '11. 唯一会被本插件执行的工具就是 skill')
+}
+
+console.log('# 12. agent/pre-step 决策原样交回，只在末尾追加消息')
+{
+  const h = ctxOf({ config: { requiredSkills: ['a'] }, services: { skills: catalog('a') } })
+  const incoming = { kind: 'enter', messages: [{ id: 'msg-0', role: 'user', content: [], source: { kind: 'user' } }], startsRequestSeries: true }
+  const decision = await h.step(Q, 9, incoming)
+  ok(decision.kind === 'enter' && decision.startsRequestSeries === true, '12. 决策字段原样交回')
+  ok(decision.messages.length === 2 && decision.messages[0].id === 'msg-0', '12. 原有消息在前，注入在后')
+
+  const rejecting = ctxOf({ config: { requiredSkills: ['a'] }, services: { skills: catalog('a') } })
+  const rejected = await rejecting.step(Q, 9, { kind: 'reject' })
+  ok(rejected.kind === 'reject' && rejecting.executed.length === 0, '12. reject 原样交回，且不加载')
+}
+
+console.log('# 13. 宿主只读路由：不起浏览器也能验注册与返回形状')
 {
   /** 假 res：只实现 handler 用到的那几个方法（writeHead / setHeader / end）。 */
   function fakeRes() {
@@ -314,25 +344,25 @@ console.log('# 10. 宿主只读路由：不起浏览器也能验注册与返回�
     },
   })
   const { routes, subscribed } = mountRoutes(h)
-  ok(subscribed === 1, '10. 只对 webServer 订阅一次（拿不到服务就不会注册路由）')
-  ok(routes.length === 1, '10. webServer 在场时注册恰好一条路由')
-  ok(routes[0] && routes[0].kind === 'exact', "10. 路由 kind 是 'exact'")
-  ok(routes[0] && routes[0].path === '/dsh-skill-gate/skill-index', '10. 路由路径是 /dsh-skill-gate/skill-index')
+  ok(subscribed === 1, '13. 只对 webServer 订阅一次（拿不到服务就不会注册路由）')
+  ok(routes.length === 1, '13. webServer 在场时注册恰好一条路由')
+  ok(routes[0] && routes[0].kind === 'exact', "13. 路由 kind 是 'exact'")
+  ok(routes[0] && routes[0].path === '/dsh-skill-gate/skill-index', '13. 路由路径是 /dsh-skill-gate/skill-index')
 
   const res = fakeRes()
   await routes[0].handler({ method: 'GET' }, res)
   const body = JSON.parse(res.body)
-  ok(res.statusCode === 200, '10. GET 返回 200')
-  ok(Array.isArray(body.skills) && body.skills.length === 2, '10. 丢掉没有名字的条目后剩两条')
-  ok(body.skills[0].name === 'alpha-skill' && body.skills[1].name === 'zeta-skill', '10. 按名字排序')
+  ok(res.statusCode === 200, '13. GET 返回 200')
+  ok(Array.isArray(body.skills) && body.skills.length === 2, '13. 丢掉没有名字的条目后剩两条')
+  ok(body.skills[0].name === 'alpha-skill' && body.skills[1].name === 'zeta-skill', '13. 按名字排序')
   ok(body.skills[1].description.length === 121 && body.skills[1].description.endsWith('…'),
-    '10. 长描述截断到 120 字加省略号')
+    '13. 长描述截断到 120 字加省略号')
   ok(typeof body.skills[0].description === 'string' && !('content' in body.skills[0]),
-    '10. 载荷只有名字与描述，没有正文')
+    '13. 载荷只有名字与描述，没有正文')
 
   const post = fakeRes()
   await routes[0].handler({ method: 'POST' }, post)
-  ok(post.statusCode === 405 && post.headers.allow === 'GET', '10. 非 GET 返回 405 且带 Allow: GET')
+  ok(post.statusCode === 405 && post.headers.allow === 'GET', '13. 非 GET 返回 405 且带 Allow: GET')
 
   // 围栏：拿不到 connection 就不服务（fail-closed）。
   const noFence = ctxOf({ config: { requiredSkills: [] }, services: { skills: { list: async () => [] } } })
@@ -340,7 +370,7 @@ console.log('# 10. 宿主只读路由：不起浏览器也能验注册与返回�
   const fenced = fakeRes()
   await noFenceRoutes[0].handler({ method: 'GET' }, fenced)
   ok(fenced.statusCode === 503 && JSON.parse(fenced.body).error.includes('fail-closed'),
-    '10. 拿不到 connection.requestRejection：503 且不服务')
+    '13. 拿不到 connection.requestRejection：503 且不服务')
 
   // 围栏拒绝：把 connection 给的状态码原样交回。
   const rejecting = ctxOf({
@@ -349,14 +379,14 @@ console.log('# 10. 宿主只读路由：不起浏览器也能验注册与返回�
   })
   const rejectRes = fakeRes()
   await mountRoutes(rejecting).routes[0].handler({ method: 'GET' }, rejectRes)
-  ok(rejectRes.statusCode === 403, '10. 围栏拒绝时把状态码原样交回')
+  ok(rejectRes.statusCode === 403, '13. 围栏拒绝时把状态码原样交回')
 
   // skills 服务缺席 / list 抛错：明确错误形状，不抛穿。
   const noSkills = ctxOf({ config: { requiredSkills: [] }, services: { connection: { requestRejection: () => undefined } } })
   const noSkillsRes = fakeRes()
   await mountRoutes(noSkills).routes[0].handler({ method: 'GET' }, noSkillsRes)
   ok(noSkillsRes.statusCode === 503 && typeof JSON.parse(noSkillsRes.body).error === 'string',
-    '10. skills 服务缺席：503 + { error }')
+    '13. skills 服务缺席：503 + { error }')
 
   const boom = ctxOf({
     config: { requiredSkills: [] },
@@ -373,19 +403,19 @@ console.log('# 10. 宿主只读路由：不起浏览器也能验注册与返回�
     handlerThrew = e
   }
   ok(handlerThrew === null && boomRes.statusCode === 502 && JSON.parse(boomRes.body).error.includes('boom'),
-    '10. list 抛错：502 + { error }，异常不抛穿')
+    '13. list 抛错：502 + { error }，异常不抛穿')
 
   // 非 web profile：webServer 缺席（订阅从不触发）时 apply 不报错，也不注册路由。
   const noWeb = ctxOf({ config: { requiredSkills: [] } })
   ok(noWeb.injects.length === 1 && noWeb.injects[0].names.join(',') === 'webServer',
-    '10. 只留一条 webServer 订阅，订阅未触发时不注册路由（非 web profile 优雅降级）')
+    '13. 只留一条 webServer 订阅，订阅未触发时不注册路由（非 web profile 优雅降级）')
   let badWebThrew = null
   try {
     noWeb.injects[0].callback({ webServer: {}, effect(fn) { return fn() } })
   } catch (e) {
     badWebThrew = e
   }
-  ok(badWebThrew === null, '10. webServer 形状不对时静默跳过，不抛')
+  ok(badWebThrew === null, '13. webServer 形状不对时静默跳过，不抛')
 
   // ── agent scope：列 catalog 必须与原生 `skill` 工具同一视角 ──────────────
   // 文件型 provider 挂在按 agent 的 scope 层；不带 scope 就只剩全局层那几份。
@@ -420,9 +450,9 @@ console.log('# 10. 宿主只读路由：不起浏览器也能验注册与返回�
     const res = fakeRes()
     await mountRoutes(h).routes[0].handler({ method: 'GET', url: '/dsh-skill-gate/skill-index' }, res)
     const body = JSON.parse(res.body)
-    ok(calls.length === 1 && calls[0].scope === agentA, '10. 有 agent 时把它原样作为 scope 传给 skills.list')
-    ok(calls[0].cwd === ensuredCwd, '10. cwd 来自 workingDirectory.ensure(agent)')
-    ok(body.scope === 'agent' && body.partial === undefined, "10. 正常路径载荷 scope='agent' 且不标 partial")
+    ok(calls.length === 1 && calls[0].scope === agentA, '13. 有 agent 时把它原样作为 scope 传给 skills.list')
+    ok(calls[0].cwd === ensuredCwd, '13. cwd 来自 workingDirectory.ensure(agent)')
+    ok(body.scope === 'agent' && body.partial === undefined, "13. 正常路径载荷 scope='agent' 且不标 partial")
   }
 
   // ?session= 命中：用它指定的 agent，而不是 roots()[0]。
@@ -438,7 +468,7 @@ console.log('# 10. 宿主只读路由：不起浏览器也能验注册与返回�
     })
     await mountRoutes(h).routes[0].handler(
       { method: 'GET', url: '/dsh-skill-gate/skill-index?session=session-target' }, fakeRes())
-    ok(calls[0].scope === agentA, '10. ?session= 命中时用它指定的 agent 当 scope')
+    ok(calls[0].scope === agentA, '13. ?session= 命中时用它指定的 agent 当 scope')
   }
 
   // ?session= 未命中：退回 roots()[0]。
@@ -449,7 +479,7 @@ console.log('# 10. 宿主只读路由：不起浏览器也能验注册与返回�
     })
     await mountRoutes(h).routes[0].handler(
       { method: 'GET', url: '/dsh-skill-gate/skill-index?session=missing' }, fakeRes())
-    ok(calls[0].scope === agentA, '10. ?session= 未命中时退回 roots()[0]')
+    ok(calls[0].scope === agentA, '13. ?session= 未命中时退回 roots()[0]')
   }
 
   // roots/list 都空：退回 currentInitiator()。
@@ -459,7 +489,7 @@ console.log('# 10. 宿主只读路由：不起浏览器也能验注册与返回�
       workingDirectory: { ensure: async () => undefined },
     })
     await mountRoutes(h).routes[0].handler({ method: 'GET', url: '/dsh-skill-gate/skill-index' }, fakeRes())
-    ok(calls[0].scope === agentA, '10. roots/list 都空时退回 currentInitiator()')
+    ok(calls[0].scope === agentA, '13. roots/list 都空时退回 currentInitiator()')
   }
 
   // 没有 agents 服务：退回 list({})，并在载荷里标 partial + reason。
@@ -469,53 +499,32 @@ console.log('# 10. 宿主只读路由：不起浏览器也能验注册与返回�
     await mountRoutes(h).routes[0].handler(
       { method: 'GET', url: '/dsh-skill-gate/skill-index?session=whatever' }, res)
     const body = JSON.parse(res.body)
-    ok(calls.length === 1 && Object.keys(calls[0]).length === 0, '10. 没有 agents 服务时退回 list({})：入参是空对象')
+    ok(calls.length === 1 && Object.keys(calls[0]).length === 0, '13. 没有 agents 服务时退回 list({})：入参是空对象')
     ok(body.partial === true && typeof body.reason === 'string' && body.reason !== '',
-      '10. 退化路径标 partial:true + 非空 reason')
-    ok(body.scope === 'global', "10. 退化路径 scope='global'")
+      '13. 退化路径标 partial:true + 非空 reason')
+    ok(body.scope === 'global', "13. 退化路径 scope='global'")
   }
 }
 
-console.log('# 11. bash 写信号按**命令位置**判：参数位置不算写，藏在参数里的写也判不了')
+console.log('# 14. 宿主把 config 读成抛错（Cordis 代理）时，pre-step 不炸且仍能自动加载')
 {
-  // 配了非空名单且本轮还没加载 ⇒ 下面的「放行」都是真判定结果，不是空名单放行。
-  const h = ctxOf({ config: { requiredSkills: ['a'] }, services: { skills: catalog('a') } })
-  const N = { id: 'agent-N' }
-  await h.step(N, 1)
-  const bash = (command) => h.guard({ name: 'bash', agent: N, arguments: { command } })
-  const allowed = (command, label) => ok(bash(command) === undefined, `11. 放行 ${label}：${command}`)
-  const blocked = (command, label) => ok(typeof bash(command) === 'string', `11. 拦下 ${label}：${command}`)
-
-  // 负向对照：这几个是旧的裸词判据（`\binstall\b` / `\bdd\b` / `\bpatch\b` / `\bsed\b`）误拦的读命令。
-  allowed('cat -n install.sh', 'install 只在参数位置')
-  allowed('grep -c dd file', 'dd 只在参数位置')
-  allowed('ls patch/', 'patch 只在参数位置')
-  allowed("sed -n '1,5p' a", 'sed 没带 -i')
-  allowed('rg -n "cp a b" README.md', '写命令词在引号里')
-  allowed('git log --grep add', 'git 子命令是 log，add 只是参数')
-
-  // 命令位置上的写命令；`git add` 与 `sort -o` 是旧判据漏拦的。
-  blocked('install -m 644 a b', 'install 在命令位置')
-  blocked('cp a b', 'cp')
-  blocked('dd if=/dev/zero of=x', 'dd')
-  blocked('git add x', 'git add（旧判据漏）')
-  blocked('sed -i s/a/b/ f', 'sed -i')
-  blocked('sort -o out in', 'sort -o（旧判据漏）')
-  blocked('sudo true', 'sudo')
-  blocked('cmd > out.txt', '非空汇输出重定向')
-  blocked('/usr/bin/rm -f x', '路径写法的命令词')
-  blocked('xargs rm -rf x', '包装命令后的命令词')
-
-  // 命令位置 = 行首或 `;` `|` `&&` `||` `$(` 等分隔符之后。
-  blocked('ls x; rm -rf /tmp/y', '分号后')
-  blocked('echo x | tee f', '管道后')
-  blocked('true && cp a b', '&& 后')
-  blocked('echo $(rm -rf /tmp/z)', '$( 里')
-  blocked('if test -f f; then rm f; fi', 'then 后')
-
-  // 已知边界（README「已知边界」写明的、故意不拦的）：写操作藏在参数或字符串里，判不了。
-  allowed('node -e "require(\'fs\').writeFileSync(\'x\',\'\')"', '已知边界：node -e 里的写判不了')
-  allowed("sh -c 'rm -rf /tmp/x'", '已知边界：sh -c 的字符串判不了')
+  // 真宿主：`ctx.config` 不是 undefined 而是抛 `cannot get property "config" without inject`，
+  // 只有 `apply(ctx, config)` 的那份配置可用。
+  const h = ctxOf({
+    configThrows: true,
+    applyConfig: { requiredSkills: ['a'] },
+    services: { skills: catalog('a') },
+  })
+  let stepError = null
+  let decision = null
+  try {
+    decision = await h.step(R, 1)
+  } catch (e) {
+    stepError = e
+  }
+  ok(stepError === null, '14. agent/pre-step 现读配置不抛错')
+  ok(h.executed.length === 1 && h.executed[0].arguments.name === 'a', '14. 兜底读 apply(ctx, config) 的名单并自动加载')
+  ok(decision.messages.length === 1, '14. 注入正文')
 }
 
-console.log(`\nskill-gate 自检：${checks} 条断言全过（插件不注册任何工具）`)
+console.log(`\nskill-gate 自检：${checks} 条断言全过（插件不注册任何工具、不注册任何守卫）`)

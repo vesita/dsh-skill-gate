@@ -4,7 +4,7 @@
     /**
      * dsh-skill-gate 的浏览器半边：侧边栏「插件」页里本插件那张卡上的配置区。
      *
-     * 这里编辑 `requiredSkills` —— 本轮必须成功加载的 skill 名单。候选来自宿主半边的只读路由
+     * 这里编辑 `requiredSkills` —— 会话开始自动加载的 skill 名单。候选来自宿主半边的只读路由
      * `GET /dsh-skill-gate/skill-index`（浏览器拿不到 catalog，只能由宿主交出来），画成复选列表
      * 加一个过滤框；配置里有、但当前 catalog 里没有的名字单独一组保留下来。
      *
@@ -119,8 +119,8 @@
 
     /**
      * 一行一个名字，也接受半角/全角逗号分隔；去首尾空白、去空项、去重。
-     * 不做格式校验：宿主 schema 只要求字符串数组，catalog 里不存在的名字由门禁的软化逻辑兜住，
-     * 在这里把保存卡死反而会让用户改不动配置。
+     * 不做格式校验：宿主 schema 只要求字符串数组，catalog 里不存在的名字由自动加载的软化逻辑兜住
+     * （忽略并出声，见宿主半边），在这里把保存卡死反而会让用户改不动配置。
      */
     function splitNames(text: string): string[] {
       const out: string[] = []
@@ -148,7 +148,7 @@
 
     /**
      * 数组字段的转换 spec：存的是 `string[]`，草稿是「一行一个」的文本。
-     * 空文本走 `clear`（清掉用户层、回到 schema 默认的 `[]`），正好等于「一个都不勾 = 门禁不生效」。
+     * 空文本走 `clear`（清掉用户层、回到 schema 默认的 `[]`），正好等于「一个都不勾 = 不生效」。
      */
     const requiredSkillsField = {
       field: FIELD,
@@ -323,7 +323,7 @@
               item.description.toLowerCase().indexOf(keyword) !== -1)
 
         const selectionLine = selected.length === 0
-          ? '当前一个都没勾：名单为空，门禁不生效（这是刻意的：没配名单就不拦）。'
+          ? '当前一个都没勾：名单为空，不生效（这是刻意的：没配名单就不加载）。'
           : '已勾选 ' + selected.length + ' 份：' + selected.join('、')
 
         /** 降级路径：路由不可用时回到上一版的「一行一个名字」。 */
@@ -333,7 +333,7 @@
           h('p', { style: styles.failed, role: 'status' },
             '无法读取 skill 列表（' + (catalog.error || '未知原因') + '），已退回手动输入。'),
           h('label', { style: styles.label, htmlFor: 'dsh-skill-gate-required' }, '必读 skill 名单'),
-          h('p', { style: styles.hint }, '一行一个名字（也支持逗号分隔）。留空 = 没配名单，门禁不生效。'),
+          h('p', { style: styles.hint }, '一行一个名字（也支持逗号分隔）。留空 = 没配名单，不生效。'),
           h('textarea', {
             id: 'dsh-skill-gate-required',
             style: styles.textarea,
@@ -351,7 +351,7 @@
           'div',
           { style: styles.page, key: 'checklist' },
           h('label', { style: styles.label }, '必读 skill 名单'),
-          h('p', { style: styles.hint }, '勾上本轮必须成功加载的 skill。一个都不勾 = 名单为空 = 门禁不生效。'),
+          h('p', { style: styles.hint }, '勾上会话开始自动加载的 skill。一个都不勾 = 名单为空 = 不生效。'),
           catalog.partial
             ? h('p', { style: styles.failed, role: 'status' },
                 catalog.reason || '只列出全局层：当前没有可用的会话，项目级/用户级 skill 可能不在列表里。')
