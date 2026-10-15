@@ -1,9 +1,9 @@
 /**
  * dsh-skill-gate — 动手前的 skill 阅读门禁。
  *
- * 受保护的工具在调用前，本轮必须成功加载过 skill：
- *   - `requiredSkills` 为空（默认）：本轮成功加载过**任意一份** skill 即可；
- *   - `requiredSkills` 非空：名单里的**每一个**都要成功加载过。
+ * 受保护的工具在调用前，本轮必须成功加载过 `requiredSkills` 里列出的每一份 skill：
+ *   - `requiredSkills` 为空（默认）：**不拦** —— 没配必读名单时门禁不生效，直接放行；
+ *   - `requiredSkills` 非空：名单里的**每一个**都要在本轮成功加载过，缺哪个就拒绝哪个。
  *
  * 判定只认原生 `skill` 工具的成功调用（`tools/result` 且 `isError` 假）。
  * 本插件**不提供任何工具**：解除门禁的唯一动作是真的加载一份 skill，没有可以空手调用的
@@ -180,15 +180,6 @@ function warnUnknown(ctx, names) {
   }
 }
 
-function denyAny(toolName) {
-  return (
-    `${toolName} 被 skill-gate 拦下：本轮还没成功加载过任何 skill。` +
-    '先按任务内容扫一遍 skill catalog，命中就调 skill({ name: "<命中项>" }) 加载；' +
-    '确认没有匹配项时，也要真实加载一份 skill 来完成本轮判定。' +
-    '只读工具（read / grep / glob 等）与只读 bash 不受限制。'
-  )
-}
-
 function denyMissing(toolName, missing) {
   const calls = missing.map((item) => `skill({ name: "${item}" })`).join('、')
   return (
@@ -255,18 +246,17 @@ export function apply(ctx, config) {
     if (id === undefined) return undefined // 无会话身份，不拦
     if (!isGuarded(exec)) return undefined
 
+    // 没配必读名单 = 门禁不生效：直接放行。
+    // （判定看的是「必读名单读全了没有」，不是「有没有加载过 skill」——后者是旧语义，已去掉。）
     const required = requiredNow()
-    const loaded = loadedSkills.get(id)
-
-    if (required.length === 0) {
-      // 默认语义：本轮成功加载过任意一份 skill 即放行
-      return loaded && loaded.size > 0 ? undefined : denyAny(exec.name)
-    }
+    if (required.length === 0) return undefined
 
     // 非空名单：catalog 在场的名字逐个要求加载过；不在场的名字本轮忽略（反死锁）。
-    // catalog 取不到（catalogOf 缺项或为 null）时保持严格。
+    // catalog 取不到（catalogOf 缺项或为 null）时保持严格；名单全不在场则本轮不锁死。
     const catalog = catalogOf.get(id)
     const effective = catalog instanceof Set ? required.filter((item) => catalog.has(item)) : required
+    if (effective.length === 0) return undefined
+    const loaded = loadedSkills.get(id)
     const missing = effective.filter((item) => !loaded || !loaded.has(item))
     return missing.length === 0 ? undefined : denyMissing(exec.name, missing)
   })

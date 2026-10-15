@@ -85,22 +85,25 @@ ok(Array.isArray(plugin.inject) && plugin.inject.join(',') === 'tools', "inject 
   ok(Array.isArray(value) && value.length === 0, 'Config 默认 requiredSkills 为 []')
 }
 
-console.log('# 1. 默认（requiredSkills: []）：加载任意一份前，写类工具被拒')
+console.log('# 1. 默认（requiredSkills: []）：不拦 —— 没配必读名单时门禁不生效')
 {
   const h = ctxOf({ config: { requiredSkills: [] } })
   ok(h.hasGuard(), '注册了 tools.guard')
   await h.step(A, 1)
-  ok(typeof h.guard({ name: 'write', agent: A, arguments: {} }) === 'string', '1. write 被拒')
-  ok(typeof h.guard({ name: 'edit', agent: A, arguments: {} }) === 'string', '1. edit 被拒')
-  ok(typeof h.guard({ name: 'plugin_manager', agent: A, arguments: {} }) === 'string', '1. plugin_manager 被拒')
-  ok(typeof h.guard({ name: 'bash', agent: A, arguments: { command: 'echo x > /tmp/f' } }) === 'string', '1. 写 bash 被拒')
+  ok(h.guard({ name: 'write', agent: A, arguments: {} }) === undefined, '1. 空名单：write 放行')
+  ok(h.guard({ name: 'edit', agent: A, arguments: {} }) === undefined, '1. 空名单：edit 放行')
+  ok(h.guard({ name: 'plugin_manager', agent: A, arguments: {} }) === undefined, '1. 空名单：plugin_manager 放行')
+  ok(
+    h.guard({ name: 'bash', agent: A, arguments: { command: 'echo x > /tmp/f' } }) === undefined,
+    '1. 空名单：写 bash 也放行',
+  )
   h.result(A, 'any-skill')
-  ok(h.guard({ name: 'write', agent: A, arguments: {} }) === undefined, '1. 加载任意一份后放行')
+  ok(h.guard({ name: 'write', agent: A, arguments: {} }) === undefined, '1. 空名单：加载与否都不拦')
 }
 
-console.log('# 2. 只读不误伤')
+console.log('# 2. 只读不误伤（配了必读名单，所以「放行」是真的判定结果，不是空名单放行）')
 {
-  const h = ctxOf({ config: { requiredSkills: [] } })
+  const h = ctxOf({ config: { requiredSkills: ['a'] }, services: { skills: catalog('a') } })
   await h.step(B, 1)
   ok(h.guard({ name: 'read', agent: B, arguments: {} }) === undefined, '2. read 放行')
   ok(h.guard({ name: 'grep', agent: B, arguments: {} }) === undefined, '2. grep 放行')
@@ -160,34 +163,36 @@ console.log("# 3. requiredSkills: ['a','b']：逐个加载才放行")
 
 console.log('# 4. 失败的加载不算数')
 {
-  const h = ctxOf({ config: { requiredSkills: [] } })
-  await h.step(E, 1)
-  h.result(E, 'any-skill', true)
-  ok(typeof h.guard({ name: 'write', agent: E, arguments: {} }) === 'string', '4. isError 的 skill 调用不算判定')
-  h.resultVia(E, 'read')
-  ok(typeof h.guard({ name: 'write', agent: E, arguments: {} }) === 'string', '4. 别的工具的成功结果不算判定')
-
   const h2 = ctxOf({ config: { requiredSkills: ['a'] }, services: { skills: catalog('a') } })
   await h2.step(F, 1)
   h2.result(F, 'a', true)
   ok(typeof h2.guard({ name: 'write', agent: F, arguments: {} }) === 'string', '4. 必读名单里的失败加载不算数')
   h2.result(F, 'a')
   ok(h2.guard({ name: 'write', agent: F, arguments: {} }) === undefined, '4. 随后成功加载才放行')
+
+  const h3 = ctxOf({ config: { requiredSkills: ['a'] }, services: { skills: catalog('a') } })
+  await h3.step(E, 1)
+  h3.resultVia(E, 'read')
+  ok(typeof h3.guard({ name: 'write', agent: E, arguments: {} }) === 'string', '4. 别的工具的成功结果不算数')
+  h3.result(E, 'b')
+  ok(typeof h3.guard({ name: 'write', agent: E, arguments: {} }) === 'string', '4. 加载名单外的 skill 也不算数')
 }
 
-console.log('# 5. 换 turn 重置 + agent/disposed 回收')
+console.log('# 5. 换 turn 重置 + agent/disposed 回收（必读名单每轮重新要求）')
 {
-  const h = ctxOf({ config: { requiredSkills: [] } })
+  const h = ctxOf({ config: { requiredSkills: ['x'] }, services: { skills: catalog('x') } })
   await h.step(G, 1)
   h.result(G, 'x')
-  ok(h.guard({ name: 'write', agent: G, arguments: {} }) === undefined, '5. turn 1 加载后放行')
+  ok(h.guard({ name: 'write', agent: G, arguments: {} }) === undefined, '5. turn 1 加载必读后放行')
   await h.step(G, 2)
-  ok(typeof h.guard({ name: 'write', agent: G, arguments: {} }) === 'string', '5. 新 turn 重新要求判定')
+  ok(typeof h.guard({ name: 'write', agent: G, arguments: {} }) === 'string', '5. 新 turn 重新要求必读')
   h.result(G, 'y')
-  ok(h.guard({ name: 'write', agent: G, arguments: {} }) === undefined, '5. 新 turn 再加载后放行')
+  ok(typeof h.guard({ name: 'write', agent: G, arguments: {} }) === 'string', '5. 新 turn 加载名单外的 skill 不放行')
+  h.result(G, 'x')
+  ok(h.guard({ name: 'write', agent: G, arguments: {} }) === undefined, '5. 新 turn 再加载必读后放行')
   h.dispose(G)
   await h.step(G, 3)
-  ok(typeof h.guard({ name: 'write', agent: G, arguments: {} }) === 'string', '5. disposed 后状态被回收')
+  ok(typeof h.guard({ name: 'write', agent: G, arguments: {} }) === 'string', '5. 回收后新 turn 仍要重新加载')
 }
 
 console.log('# 6. 软化：catalog 里没有的必读名本轮忽略；取不到 catalog 时严格')
