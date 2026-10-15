@@ -1,8 +1,8 @@
 # dsh-skill-gate
 
-A DeepSeek Harness plugin that loads the skills listed in `requiredSkills` once, automatically, at session start. With an empty list it does nothing.
+A DeepSeek Harness plugin that loads the skills listed in `requiredSkills` once, automatically, at session start — the bodies go into the system prompt (the model sees them; the conversation shows only a one-line notice). With an empty list it does nothing.
 
-`dsh-skill-gate` 是一个 DeepSeek Harness 插件：会话一开始，把**必读名单**（`requiredSkills`）里的 skill **自动加载**一遍 —— 正文进本会话的上下文，不靠模型记得去调 `skill`。**没配名单就什么都不做**。
+`dsh-skill-gate` 是一个 DeepSeek Harness 插件：会话一开始，把**必读名单**（`requiredSkills`）里的 skill **自动加载**一遍 —— 正文进**系统提示**（模型照旧逐字看得到，对话里看不到），对话里只留一行短说明。不靠模型记得去调 `skill`；**没配名单就什么都不做**。
 
 ## 它解决什么问题
 
@@ -71,27 +71,31 @@ dsh plugin --profile <profile> add dsh-skill-gate
 
 ## 行为细节
 
-- **触发时机**：每个会话的**第一次 `agent/pre-step`**，一次。那是唯一能赶在第一条模型请求之前、把消息放进本步输入的缝；已在名单里加载过的会话第二次不再执行。
+- **触发时机**：`agent/created`（每个会话一次），**不是**第一次 `agent/pre-step`。这是时序要求：宿主在 `agent/pre-step` **之前**就装配好这一步的系统提示，所以在 pre-step 才加载的话，正文要等到第二步才进提示词。
 - **怎么加载**：真执行一次原生 `skill` 工具（`ctx.tools.execute({ name: 'skill', … })`），走完 `tools/pre-execute` → guards → 工具体 → `tools/post-execute` → **`tools/result` 广播**。合成的 callId 带 `skill-autoload:` 前缀，与模型发起的调用可区分。
-- **注入两条消息**（`announce` 默认 `marker` 时）：① **一条短的可见说明**（`source.form='notice'`，排在最前）—— 点名这次加载了哪几份、说明是机制触发而不是模型调用；没加载齐就点名缺哪份。② 每份 skill 一条**正文**（`source.form='instructions'`，`name` 指向它）。两者都走同一条消息通道（追加进 `decision.messages`），`source.kind` 都是 `skill-autoload`。
-- **它在对话里长什么样**：这两个来源都不是 `user`，所以 dsh 对话界面把它们渲染成**注入的上下文行**（不是用户气泡），生产者标签就是 `source.kind`；依据见 `src/index.ts` 的注释与 `selfcheck.mjs` 第 2/15 节断言（宿主侧：`dsh-agent-loop` 把 `decision.messages` 逐条 `session.append('user/message', …)`；客户端侧：非 `user` 来源一律走 `contextMessage`）。
-- **「已加载」对谁可见**：没有「标记已加载」的 API —— 它就是**一次成功的 `skill` 工具执行**。所以本插件保留 `tools/result` 观察者作为**只读观测**（谁都能听这条广播），并在加载完那一趟汇总一行 info 日志：`skill-gate: 会话开始自动加载 —— 已加载 a、b`。
+- **正文走系统提示**：拼好的正文注册成 `systemPrompt` 的一个 **section**（`name: 'skill-autoload'`、`order: 700`、**`interpolate: false`**），按 agent 取值。模型照旧逐字看得到，**对话里看不到**。
+  - `interpolate: false` 是硬要求：宿主默认把 section 文本当模板解析，`{{name}}` 不命中已注册变量就**抛错**，整条提示词注入失败。skill 正文里出现 `{{` 完全正常（`arch-canvas` 就专门为它写了守卫）。
+- **对话里只留一条短说明**（`announce` 默认 `marker` 时）：一条 `source.form='notice'` 的消息，点名这次加载了哪几份、说明是机制触发而不是模型调用、正文走了哪条路；没加载齐就点名缺哪份与原因。
+- **它在对话里长什么样**：说明的来源不是 `user`，所以 dsh 对话界面把它渲染成**注入的上下文行**（不是用户气泡），生产者标签是 `source.kind`（`skill-autoload`）。正文进的是系统提示 —— 只有展开「系统提示」卡片才看得到，它不是对话里的一行。依据：宿主侧 `dsh-agent-loop` 把 `decision.messages` 逐条 `session.append('user/message', …)` 并渲染系统提示（`SystemPromptProjection.project`）；客户端侧非 `user` 来源一律走 `contextMessage`。断言在 `selfcheck.mjs` 第 2/16 节。
+- **「已加载」对谁可见**：没有「标记已加载」的 API —— 它就是**一次成功的 `skill` 工具执行**。所以本插件保留 `tools/result` 观察者作为**只读观测**（谁都能听这条广播），并在加载完那一趟汇总一行 info 日志：`skill-gate: 会话开始自动加载（正文走系统提示）—— 已加载 a、b`。
 - **失败路径**（都不许静默）：
   - 名字不在 catalog（改名 / 删除 / 项目级看不到）→ 忽略它、记一行 warning，并在那条可见说明里点名（`未加载：<名字>（不在当前 catalog）`）；
   - 取不到 catalog（`skills` 服务缺席 / `list` 抛错 / 拿不到 cwd）→ **不标记已加载，下一步重试**（读不到 ≠ 没有）；同一个会话只出声一次，不刷屏；
   - 单个 skill 执行失败（被别的守卫拒了 / provider 读不到）→ 不注入正文，改成说明里点名 + 原因；
   - **一条都没成功也留说明** —— 否则「配了名单」看起来就像「已经加载过了」；
   - `skill` 工具在该 scope 不可见（被 restrict / PTC 模式）→ 退回 `ctx.skills.get()` + 宿主提供的 `renderSkillContent()`；
-  - 拿不到宿主的 `createUserMessage`（消息构造器）→ 出声一次、本会话不加载（没有交付面就不做注定看不见的执行），不抛错。
+  - **降级（两条交付通道）**：拿不到 `systemPrompt`（老版本宿主 / 非 web 形态），或这次加载只能等到 `agent/pre-step` 才补做（会话开始时 catalog 还没就绪）→ 正文**退回本步消息**注入（`form: 'instructions'`，对话里看得见），说明里点明是哪种原因。宁可噪声，也不能让名单里的 skill 悄悄不在上下文里。
+  - 两条通道都没有（没有 `systemPrompt`、也拿不到 `createUserMessage`）→ 出声一次、本会话不加载（不做注定看不见的执行），不抛错。
 - **反死锁**：名单里的名字当前 catalog 里不存在时按上面第一条处理；本插件不会因为配错名字而卡住任何工具调用（它本来也不拦）。
 
 ## 已知边界
 
 - 能证明的只是**加载动作发生过**，证明不了模型真的读了正文。
 - catalog 是 best-effort：按当前 workspace 的 skill 视图判断，视图没就绪时会顺延到下一步重试。
-- 注入进的是**会话历史**：长会话被压缩 / 裁剪之后，这段正文可能不再出现在可见窗口里。当前实现按会话去重一次，**不会**在压缩后自动重注入。
+- **正文进的是系统提示**：它在每一轮请求里都在，但不会作为对话里的一行出现（要看得展开「系统提示」卡片）。这也意味着它随提示词一起占用上下文，长名单 / 长正文会一直计费。
+- **降级时会看得见正文**：没有 `systemPrompt`、或加载只能在 `agent/pre-step` 补做的会话，正文退回消息注入 —— 那是刻意的取舍（噪声 < 静默丢纪律），说明行里会点明原因。
 - 名单在会话开始后才改（volatile 字段）：本次会话不受影响，下一次会话开始才生效。
-- **out-of-band 执行待实机验证**（与上面「说明进 durable」是两件事）：`ctx.tools.execute` 不是模型发起的调用，所以它**不产生** `tool/call` 那条 durable 记录（只发 `tools/result` 广播）；注入的**消息**照旧进 durable 会话（宿主把 `decision.messages` 逐条 append）。GUI 上会不会出现「没有对应调用行」的孤立结果行，需要在真宿主里跑一次看。若确实会污染，切到「方案 B」：把 `src/index.ts` 的 `loadSkill()` 里 `ctx.tools.execute` 那段删掉、直接走它的退化分支（代价：`tools/result` 观察者看不到这次加载）。
+- **out-of-band 执行待实机验证**：`ctx.tools.execute` 不是模型发起的调用，所以它**不产生** `tool/call` 那条 durable 记录（只发 `tools/result` 广播）；对话里那条说明照旧是 durable 的 `user/message`。GUI 上会不会出现「没有对应调用行」的孤立结果行，需要在真宿主里跑一次看。若确实会污染，切到「方案 B」：把 `src/index.ts` 的 `loadSkill()` 里 `ctx.tools.execute` 那段删掉、直接走它的退化分支（代价：`tools/result` 观察者看不到这次加载）。
 - 本插件不把 `@deepseek-ai/dsh-llm` / `dsh-skill` 写进依赖：`createUserMessage` 与 `renderSkillContent` 由**宿主**提供（运行时从插件安装目录解析到的就是宿主那一份），拿不到时走上表的失败路径；**不会**在本仓手抄一份构造函数副本。
 
 ## License

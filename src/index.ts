@@ -1,17 +1,23 @@
 /**
  * dsh-skill-gate — 会话开始自动加载必读 skill（**不再拦截任何工具调用**）。
  *
- * 第一次 `agent/pre-step` 时，把 `requiredSkills` 里的 skill 逐个**真执行一次加载**：
+ * `agent/created` 时，把 `requiredSkills` 里的 skill 逐个**真执行一次加载**：
  * `ctx.tools.execute({ name: 'skill', … })` 走完 `tools/pre-execute` → guards → 工具体 →
- * `tools/post-execute` → `tools/result` 广播，再把返回的内容块作为**本步消息**注入。
+ * `tools/post-execute` → `tools/result` 广播。放在 created 而不是 pre-step 是**时序要求**：
+ * `systemPrompt.assemble()` 在 `agent/pre-step` 之前跑，想让正文进**第一条**模型请求就得先加载完。
  *   - `requiredSkills` 为空（默认）：什么都不做 —— 没配名单 = 不生效；
- *   - 非空：catalog 里有的逐个加载；不在 catalog 的忽略并出声；**一条都没成功也注入说明行**。
+ *   - 非空：catalog 里有的逐个加载；不在 catalog 的忽略并出声；**一条都没成功也留说明**。
  *
- * 注入分两种消息，都是 durable 的 `user/message`（客户端按来源分流：非 `user` 来源 = 注入的上下文行）：
- *   - 正文（`form: 'instructions'`）：每份一份，给模型看；
- *   - **一行短的说明**（`form: 'notice'`）：点名这次加载了哪几份、说明是机制触发而不是模型调用，
- *     失败时点名缺哪份 —— 这就是用户能在对话里看见的那一行。`announce: 'off'` 只关掉「全部成功」
- *     那条；**没加载齐是状态，出声不受开关影响**。
+ * 正文与说明走**两条不同的通道**：
+ *   - **正文**走 `systemPrompt.section({ interpolate: false })` —— 进系统提示，模型看得到、
+ *     对话里看不到（`interpolate: false` 是硬要求：正文里的 `{{` 会被宿主当模板解析并抛错）；
+ *   - **一行短的说明**走本步消息（`source.form = 'notice'`）—— 它就是用户在对话里看得见的那一行：
+ *     点名这次加载了哪几份、说明是机制触发而不是模型调用，失败时点名缺哪份，并点明正文走了哪条路。
+ *     `announce: 'off'` 只关掉「全部成功」那条；**没加载齐是状态，出声不受开关影响**。
+ *
+ * 降级（拿不到 `systemPrompt`，或加载发生在 pre-step 才补做）时，正文退回**本步消息**注入
+ * （`form: 'instructions'`，对话里看得见），说明里点明原因 —— 宁可噪声，也不能让名单里的 skill
+ * 悄悄不在上下文里。
  *
  * 「已加载」不是服务状态（`skills` 服务没有 isLoaded）：它就是**一次成功的 `skill` 工具执行**，
  * 所以本插件保留 `tools/result` 观察者作为**只读观测**（记录「这个会话加载过哪些」并汇总一行日志），
@@ -46,8 +52,25 @@ export const Config = z.object({
 /** 自动加载那次执行的 callId 前缀：与模型发起的调用可区分，日志里一眼可辨。 */
 const AUTOLOAD_CALL_PREFIX = 'skill-autoload:'
 
-/** agentId -> 这个会话已经自动加载过。**只前进**（catalog 读不到是唯一的例外，见 pre-step）。 */
-const autoLoaded = new Set()
+/** 系统提示里承载自动加载正文的 section 名。 */
+export const AUTOLOAD_SECTION_NAME = 'skill-autoload'
+
+/**
+ * section 的排序位（越小越靠前）。取 700：在策略段（persona 0 / plan 500 / team 600）之后、
+ * 工具说明段（1000 起）之前 —— 这几份正文是「这次会话的背景」，不该挤在工具契约中间。
+ */
+const AUTOLOAD_SECTION_ORDER = 700
+
+/**
+ * agentId -> 这个会话自动加载的结果。
+ *
+ * **只前进**（catalog 读不到是唯一的例外，见 pre-step）；`channel` 记正文这一轮走了哪条路，
+ * 说明行里会点明 —— 降级也要看得见。
+ */
+const autoLoads = new Map()
+
+/** agentId -> 说明行已经注入过。正文是否已交付由 `autoLoads` 记，两件事分开。 */
+const announced = new Set()
 
 /** agentId -> 本会话加载过的 skill 名。`tools/result` 只读观测的记录，也是日志汇总的来源。 */
 const loadedSkills = new Map()
@@ -301,16 +324,52 @@ async function loadSkill(ctx, agent, signal, name, helpers: HostHelpers) {
  *
  * 它同时是模型与本步输入里的收尾句：点名这次自动加载了哪几份、说明是机制触发而不是模型调用；
  * 没加载齐（含一条都没成功）时点名缺哪份 —— 后者是**状态**，不是装饰，所以 `announce: off` 也拦不住它。
+ * `channel` / `why` 用来点明**正文这一轮走了哪条路**（系统提示 / 随消息注入），降级不许静默。
  */
-function autoloadMarkerText(loadedNames, missing) {
+function autoloadMarkerText(loadedNames, missing, channel, why) {
   const head = 'skill-gate：会话开始自动加载（机制触发，不是模型调用）'
+  const where = channel === 'section'
+    ? '（正文在系统提示里，不占对话）'
+    : `（正文随消息注入：${why || '会话开始时还没就绪'}）`
   if (loadedNames.length === 0) {
     return `${head}未完成 —— 未加载：${missing.join('；')}。不要假定这些纪律已在上下文中。`
   }
   const done = `已加载 ${loadedNames.join('、')}`
   return missing.length === 0
-    ? `${head}：${done}。`
-    : `${head}：${done}；未加载：${missing.join('；')}。`
+    ? `${head}：${done}${where}。`
+    : `${head}：${done}；未加载：${missing.join('；')}${where}。`
+}
+
+/** 把工具返回的内容块折成纯文本：系统提示的 section 只吃字符串。 */
+function blocksToText(blocks) {
+  if (!Array.isArray(blocks)) return ''
+  return blocks
+    .map((block) => (block && block.type === 'text' && typeof block.text === 'string' ? block.text : ''))
+    .filter((text) => text.length > 0)
+    .join('\n')
+}
+
+/** 取宿主 `systemPrompt` 服务：**可选**（不进 inject —— 没有它的形态里不该让插件永远 park）。 */
+function getSystemPrompt(ctx) {
+  try {
+    const service = ctx.get('systemPrompt')
+    return service && typeof service === 'object' ? service : undefined
+  } catch (error) {
+    return undefined
+  }
+}
+
+/**
+ * section 的 text 提供者：按**这一步的 agent** 取这次自动加载的正文（`systemPrompt.assemble`
+ * 传进来的装配上下文带 `agent`）。
+ *
+ * 没加载过、或这一轮正文走的是消息通道（降级）时返回空串 —— 空 section 不会进提示词。
+ */
+function autoloadTextOf(asctx) {
+  const id = asctx && asctx.agent ? asctx.agent.id : undefined
+  if (id === undefined) return ''
+  const record = autoLoads.get(id)
+  return record && record.channel === 'section' ? record.text : ''
 }
 
 /**
@@ -483,8 +542,106 @@ export function apply(ctx, config, deps: HostHelpers = {}) {
   const announceNow = () => readAnnounce([liveConfig(ctx), config])
   const helpersPromise = resolveHostHelpers(deps)
 
-  // 会话开始自动加载：`agent/pre-step` 的**首次触发**是唯一能赶在第一条模型请求前
-  // 把消息放进本步输入的缝。waterfall —— 决策必须原样交回，只允许往后追加消息。
+  // 正文的交付通道：**系统提示的 section** 优先（模型看得到、对话里看不到）。section 的 text 是
+  // 在 `systemPrompt.assemble()` 里取的，所以注册一次就够，按 agent 取值。
+  // `interpolate: false` 是**硬要求**：skill 正文里可能出现 `{{`（arch-canvas 就专门写了守卫），
+  // 不传这个开关宿主会按模板解析、引用不成立就**抛错**，整条提示词注入失败、会话起不来。
+  const prompt = getSystemPrompt(ctx)
+  let useSection = typeof prompt?.section === 'function'
+  if (useSection) {
+    try {
+      ctx.effect(() => prompt.section({
+        name: AUTOLOAD_SECTION_NAME,
+        order: AUTOLOAD_SECTION_ORDER,
+        interpolate: false,
+        text: (asctx) => autoloadTextOf(asctx),
+      }), 'skill-gate: skill-autoload section')
+    } catch (error) {
+      useSection = false
+      try {
+        ctx.logger?.warn?.('skill-gate: 注册 systemPrompt section 失败，正文退回消息注入：' + errorMessageOf(error))
+      } catch (logError) {
+        // 日志失败不影响降级
+      }
+    }
+  }
+
+  /**
+   * 把一个会话的必读 skill 加载掉（同一个会话只做一次）。
+   *
+   * `when` 决定正文走哪条路：**在 `agent/created` 加载完**的会话走系统提示 section。
+   * 原因是时序 —— `systemPrompt.assemble()` 发生在 `agent/pre-step` **之前**
+   * （`dsh-agent-loop` 的 `preStep`：先 assemble、再跑 waterfall），所以想让正文进**第一条**请求，
+   * 只能在 created 就加载完；到 pre-step 才加载的话，section 要到第二步才生效。
+   * created 没做成（catalog 未就绪等）时退回 pre-step 补做，那时正文只能走消息通道（对话里看得见）
+   * —— 宁可噪声，也不能让名单里的 skill 悄悄不在上下文里。
+   */
+  const ensureAutoLoaded = async (agent, signal, when) => {
+    const id = agent?.id
+    if (id === undefined) return null
+    const cached = autoLoads.get(id)
+    if (cached !== undefined) return cached
+    const required = requiredNow()
+    if (required.length === 0) return null // 没配名单 = 不生效
+
+    const catalog = await fetchCatalog(ctx, agent, signal)
+    if (catalog === null) {
+      // 读不到 ≠ 没有：**不标记**，下一步重试（catalog 往往只是还没就绪）。
+      warnOnce(ctx, catalogWarned, id, '取不到 skill catalog，本次不自动加载，下一步重试')
+      return null
+    }
+    const unknown = required.filter((item) => !catalog.has(item))
+    if (unknown.length > 0) warnUnknown(ctx, unknown)
+
+    const helpers = await helpersPromise
+    const names = []
+    const missing = unknown.map((item) => `${item}（不在当前 catalog）`)
+    const bodies = []
+    for (const skillName of required) {
+      if (!catalog.has(skillName)) continue
+      const loaded = await loadSkill(ctx, agent, signal, skillName, helpers)
+      if (loaded.content === null) {
+        missing.push(`${skillName}（${loaded.reason}）`)
+        continue
+      }
+      names.push(skillName)
+      bodies.push({ name: skillName, content: loaded.content })
+    }
+
+    // created 期一份都没成：不回存 —— 留给 pre-step 在**运行期**再试一次（那时执行工具更稳），
+    // 仍不成才如实记下来。
+    if (when === 'created' && names.length === 0 && missing.length > 0) return null
+
+    const record = {
+      names,
+      missing,
+      bodies,
+      text: bodies.map((body) => blocksToText(body.content)).filter((text) => text.length > 0).join('\n\n'),
+      channel: useSection && when === 'created' ? 'section' : 'message',
+      why: !useSection ? '本部署没有 systemPrompt' : when === 'created' ? '' : '会话开始时还没就绪',
+    }
+    autoLoads.set(id, record)
+    return record
+  }
+
+  // 会话开始：赶在第一条模型请求装配提示词**之前**把正文准备好（见 ensureAutoLoaded 的注释）。
+  // `agent/created` 的监听器是 serial 的：抛错会让这次创建整体失败，所以这里自己吞掉异常。
+  ctx.on('agent/created', async (payload) => {
+    try {
+      // 两条交付通道都没有（没有 systemPrompt、也拿不到消息构造器）时，不执行注定看不见的加载。
+      if (!useSection && typeof (await helpersPromise).createUserMessage !== 'function') return
+      await ensureAutoLoaded(payload?.agent, payload?.signal, 'created')
+    } catch (error) {
+      try {
+        ctx.logger?.warn?.('skill-gate: 会话开始自动加载失败：' + errorMessageOf(error))
+      } catch (logError) {
+        // 日志失败不影响创建
+      }
+    }
+  })
+
+  // 说明行（以及降级时的正文）在这里注入：消息只能从这个缝进本步输入。
+  // waterfall —— 决策必须原样交回，只允许往后追加消息。
   ctx.on('agent/pre-step', async (payload, next) => {
     const decision = await next()
     if (!decision || decision.kind === 'reject') return decision
@@ -492,66 +649,59 @@ export function apply(ctx, config, deps: HostHelpers = {}) {
     const agent = payload?.agent
     const id = agent?.id
     if (id === undefined) return decision // 无会话身份：不做事
-    if (autoLoaded.has(id)) return decision // 会话一次
+    if (announced.has(id)) return decision // 说明一行一次
 
     const required = requiredNow()
     if (required.length === 0) return decision // 没配名单 = 不生效
 
     const announce = announceNow()
-
-    // 拿不到宿主的消息构造器就没有交付面：出声一次、本会话不再重试（否则每步都会重复执行加载）。
     const helpers = await helpersPromise
-    if (typeof helpers.createUserMessage !== 'function') {
-      autoLoaded.add(id)
-      warnOnce(ctx, catalogWarned, id, '拿不到宿主的 createUserMessage，无法注入必读 skill 正文；本次不自动加载')
+    // 没有 systemPrompt、也拿不到宿主的消息构造器：两条交付通道都没有。出声一次、本会话不再重试
+    // （否则每步都会重复执行注定看不见的加载）。
+    if (!useSection && typeof helpers.createUserMessage !== 'function') {
+      announced.add(id)
+      warnOnce(ctx, catalogWarned, id, '拿不到宿主的 createUserMessage 且没有 systemPrompt：本会话不自动加载')
       return decision
     }
+    const record = await ensureAutoLoaded(agent, payload?.signal, 'pre-step')
+    if (record === null) return decision // catalog 读不到：不标记，下一步重试
 
-    const catalog = await fetchCatalog(ctx, agent, payload?.signal)
-    if (catalog === null) {
-      // 读不到 ≠ 没有：**不标记**，下一步重试（catalog 往往只是还没就绪）。
-      warnOnce(ctx, catalogWarned, id, '取不到 skill catalog，本次不自动加载，下一步重试')
-      return decision
-    }
-
-    const unknown = required.filter((item) => !catalog.has(item))
-    if (unknown.length > 0) warnUnknown(ctx, unknown)
-
+    announced.add(id)
     const messages = []
-    const loadedNames = []
-    const missing = unknown.map((item) => `${item}（不在当前 catalog）`)
-    for (const skillName of required) {
-      if (!catalog.has(skillName)) continue
-      const loaded = await loadSkill(ctx, agent, payload?.signal, skillName, helpers)
-      if (loaded.content === null) {
-        missing.push(`${skillName}（${loaded.reason}）`)
-        continue
-      }
-      loadedNames.push(skillName)
-      messages.push(helpers.createUserMessage({
-        content: loaded.content,
-        source: { kind: 'skill-autoload', name: skillName, form: 'instructions' },
-      }))
+    const canMessage = typeof helpers.createUserMessage === 'function'
+    if (!canMessage && record.names.length > 0 && record.channel === 'message') {
+      warnOnce(ctx, catalogWarned, id, '拿不到宿主的 createUserMessage：说明与正文都进不了本步输入，本次会话读不到自动加载的内容')
     }
 
-    // 一条**可见且短**的说明，排在正文之前（读起来先看到「发生了什么」，再是那几份正文）。
+    // 一条**可见且短**的说明，排在正文之前（读起来先看到「发生了什么」）。
     // 它进的是 durable 会话（agent-loop 把 decision.messages 逐条 append 成 user/message），
-    // 客户端把非 `user` 来源的这类行渲染成**注入的上下文行**（生产者也因此看得见）。
+    // 客户端把非 `user` 来源的这类行渲染成**注入的上下文行**。
     // `announce: off` 只关掉「全部加载成功」那条；没加载齐是状态，出声不受开关影响。
-    if (announce !== 'off' || missing.length > 0) {
-      const text = autoloadMarkerText(loadedNames, missing)
+    if (canMessage && (announce !== 'off' || record.missing.length > 0)) {
+      const text = autoloadMarkerText(record.names, record.missing, record.channel, record.why)
       messages.unshift(helpers.createUserMessage({
         content: [{ type: 'text', text }],
         source: { kind: 'skill-autoload', name: '*', form: 'notice', summary: clipText(text, 120) },
       }))
     }
 
-    autoLoaded.add(id)
+    // 正文：**只有消息通道**才进对话。section 通道由系统提示承担，这里一条都不注入 ——
+    // 否则就是同一份正文既在提示词里、又在对话里的双重噪声（这正是本次要修的问题）。
+    if (record.channel === 'message' && canMessage) {
+      for (const body of record.bodies) {
+        messages.push(helpers.createUserMessage({
+          content: body.content,
+          source: { kind: 'skill-autoload', name: body.name, form: 'instructions' },
+        }))
+      }
+    }
+
     try {
-      const recorded = loadedSkills.get(id)
+      const where = record.channel === 'section' ? '系统提示' : '消息'
       ctx.logger?.info?.(
-        'skill-gate: 会话开始自动加载 —— 已加载 ' + (recorded ? [...recorded].join('、') : '无') +
-        (missing.length > 0 ? `；未加载 ${missing.join('；')}` : ''),
+        'skill-gate: 会话开始自动加载（正文走' + where + '）—— 已加载 ' +
+        (record.names.length > 0 ? record.names.join('、') : '无') +
+        (record.missing.length > 0 ? `；未加载 ${record.missing.join('；')}` : ''),
       )
     } catch (error) {
       // 日志失败不影响注入
@@ -581,7 +731,8 @@ export function apply(ctx, config, deps: HostHelpers = {}) {
   ctx.on('agent/disposed', ({ agent }) => {
     const id = agent?.id
     if (id === undefined) return
-    autoLoaded.delete(id)
+    autoLoads.delete(id)
+    announced.delete(id)
     loadedSkills.delete(id)
     catalogWarned.delete(id)
   })

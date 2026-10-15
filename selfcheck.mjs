@@ -18,6 +18,35 @@ let msgSeq = 0 /** 假的消息构造器：只为断言看得见 id 递增。 */
 const createUserMessage = (input) => ({ ...input, id: `msg-${++msgSeq}`, role: 'user' })
 const renderSkillContent = (skill) => `<skill_content name="${skill.name}">${skill.content}</skill_content>`
 
+// 复刻宿主 `dsh-system-prompt` 的模板渲染（`renderPrompt()` / `interpolate()`）：
+// `interpolate === false` 的 section **原样返回**；否则 `{{name}}` 必须命中已注册变量，**不命中就抛错**。
+// 这是「skill 正文里的 `{{` 会不会把整条提示词注入搞崩」这条判据的伪宿主实现。
+const GROUP_AT = /^\{\{([^{}]*)\}\}/
+function interpolateLikeHost(section) {
+  const text = section.text
+  let result = ''
+  let last = 0
+  for (let open = text.indexOf('{{'); open >= 0; open = text.indexOf('{{', last)) {
+    const group = GROUP_AT.exec(text.slice(open))
+    if (group === null) {
+      if (text.indexOf('}}', open + 2) >= 0) throw new Error(`malformed prompt variable reference in section "${section.name}"`)
+      result += text.slice(last, open + 2)
+      last = open + 2
+      continue
+    }
+    const name = group[0].slice(2, -2)
+    throw new Error(`unknown prompt variable "{{${name}}}" in section "${section.name}"`)
+  }
+  return result + text.slice(last)
+}
+function renderLikeHost(section, text) {
+  return section.interpolate === false ? text : interpolateLikeHost({ name: section.name, text })
+}
+/** section 的 text 可能是函数（装配时才求值）：按宿主那样把装配上下文（带 agent）传进去。 */
+function sectionTextOf(def, agent) {
+  return typeof def.text === 'function' ? def.text({ agent, scope: agent }) : def.text
+}
+
 /** 假 ctx：手写 on / tools / get / logger / inject，config 可在运行中替换。
  *  `configThrows` 复刻 Cordis 代理的行为：未 inject 的属性**抛错**，不是 undefined。 */
 function makeCtx(opts = {}) {
@@ -26,13 +55,21 @@ function makeCtx(opts = {}) {
   const warnings = []
   const infos = []
   const injects = []
+  const sections = []
   const executed = []
   let guardRegistered = false
   const services = opts.services ?? {}
+  if (opts.systemPrompt) {
+    services.systemPrompt = { section(def) { sections.push(def); return () => {} } }
+  }
   const ctx = {
     on(event, fn) { handlers.set(event, fn) },
     get(name) { return services[name] },
     inject(names, callback) { injects.push({ names, callback }); return () => {} },
+    effect(fn) {
+      const dispose = fn()
+      return () => { if (typeof dispose === 'function') dispose() }
+    },
     logger: {
       warn: (m) => { warnings.push(String(m)) },
       info: (m) => { infos.push(String(m)) },
@@ -74,8 +111,11 @@ function makeCtx(opts = {}) {
     warnings,
     infos,
     injects,
+    sections,
     executed,
     hasGuard: () => guardRegistered,
+    // 会话创建：真宿主在这里、且在第一条请求装配提示词**之前**触发。
+    created: (agent) => handlers.get('agent/created')({ agent, source: 'startup', signal: undefined }),
     step: (agent, turn = 1, decision = { kind: 'enter', messages: [] }) =>
       handlers.get('agent/pre-step')({ agent, turn, step: 1, signal: undefined }, async () => decision),
     result: (agent, skillName, isError = false) =>
@@ -107,6 +147,10 @@ const R = { id: 'agent-R' }
 const S = { id: 'agent-S' }
 const T = { id: 'agent-T' }
 const U = { id: 'agent-U' }
+const V = { id: 'agent-V' }
+const W = { id: 'agent-W' }
+const X = { id: 'agent-X' }
+const Y = { id: 'agent-Y' }
 
 const allCtxs = []
 function ctxOf(opts) {
@@ -559,6 +603,80 @@ console.log('# 15. announce 开关：`off` 只关掉「全部加载成功」那�
   ok(typed.messages.filter((m) => m.source.form === 'notice').length === 1, '15. 认不出的取值按默认 marker 处理')
   const parsed = Config['~standard'].validate({}).value.announce
   ok((parsed && typeof parsed.get === 'function' ? parsed.get() : parsed) === 'marker', '15. Config 默认 announce 为 marker')
+}
+
+console.log('# 16. 正文走系统提示 section（对话里只留说明）；装配发生在 pre-step 之前，所以 created 期加载')
+{
+  const h = ctxOf({
+    config: { requiredSkills: ['a', 'b'] },
+    systemPrompt: true,
+    services: { skills: catalog('a', 'b') },
+  })
+  ok(h.sections.length === 1, '16. 注册了恰好一个 systemPrompt section')
+  const def = h.sections[0]
+  ok(def.name === 'skill-autoload', '16. section 名是 skill-autoload')
+  ok(typeof def.order === 'number' && Number.isFinite(def.order), '16. section 带有限 order')
+  ok(def.interpolate === false, "16. section 显式 interpolate:false（否则正文里的 {{ 会被当模板）")
+  ok(sectionTextOf(def, V) === '', '16. 还没加载过：section 是空串（不进提示词）')
+
+  await h.created(V) // 真宿主在装配第一条请求的提示词之前触发
+  ok(h.executed.length === 2, '16. created 期就把两份都加载了（赶在 pre-step 的 assemble 之前）')
+  const text = sectionTextOf(def, V)
+  ok(text.includes('<skill_content name="a">body</skill_content>'), '16. section 正文就是这次加载的正文（a）')
+  ok(text.includes('<skill_content name="b">body</skill_content>'), '16. 两份都在同一个 section 里（b）')
+  ok(sectionTextOf(def, W) === '', '16. 按 agent 归属：别的会话拿到的是空串')
+
+  const decision = await h.step(V, 1)
+  ok(decision.messages.filter((m) => m.source.form === 'instructions').length === 0,
+    "16. 正文**不再**是 messages 里的 form:'instructions'（对话里看不到正文）")
+  const notices = decision.messages.filter((m) => m.source.form === 'notice')
+  ok(notices.length === 1 && decision.messages.length === 1, '16. 本步消息只剩那一条说明')
+  ok(notices[0].content[0].text.includes('正文在系统提示里'), '16. 说明点明正文走了系统提示、不占对话')
+  ok(renderLikeHost(def, text) === text, '16. 传了 interpolate:false：宿主原样返回，不抛')
+
+  // 降级：拿不到 systemPrompt → 正文退回消息（对话里看得见），说明里点明
+  const noPrompt = ctxOf({ config: { requiredSkills: ['a'] }, services: { skills: catalog('a') } })
+  const fallback = await noPrompt.step(X, 1)
+  ok(fallback.messages.filter((m) => m.source.form === 'instructions').length === 1,
+    '16. 没有 systemPrompt：正文仍作消息注入（宁可噪声也不丢正文）')
+  const fallbackNotice = fallback.messages.find((m) => m.source.form === 'notice')
+  ok(fallbackNotice.content[0].text.includes('本部署没有 systemPrompt'),
+    '16. 降级说明里点明原因')
+
+  // 降级：有 systemPrompt，但加载发生在 pre-step（created 没做成）→ 这一轮仍走消息
+  const late = ctxOf({ config: { requiredSkills: ['a'] }, systemPrompt: true, services: { skills: catalog('a') } })
+  const lateDecision = await late.step(Y, 1)
+  ok(lateDecision.messages.filter((m) => m.source.form === 'instructions').length === 1,
+    '16. created 没做成时：正文这一轮仍作消息注入')
+  ok(lateDecision.messages.find((m) => m.source.form === 'notice').content[0].text.includes('会话开始时还没就绪'),
+    '16. 并点明是「会话开始时还没就绪」')
+}
+
+console.log('# 17. 负向对照：正文里的 {{hexagon}} 在没传 interpolate:false 的实现下会抛错')
+{
+  const h = ctxOf({
+    config: { requiredSkills: ['a'] },
+    systemPrompt: true,
+    services: { skills: catalog('a') },
+    executeResult: () => ({
+      isError: false,
+      content: [{ type: 'text', text: '<skill_content name="a">{{hexagon}}</skill_content>' }],
+    }),
+  })
+  await h.created(W)
+  const def = h.sections[0]
+  const text = sectionTextOf(def, W)
+  ok(text.includes('{{hexagon}}'), '17. 正文原样带着 {{hexagon}}')
+  let err = null
+  try {
+    renderLikeHost({ ...def, interpolate: undefined }, text)
+  } catch (e) {
+    err = e
+  }
+  ok(err !== null && /unknown prompt variable/.test(err.message),
+    '17. 没传 interpolate:false 的实现在伪宿主里抛错（这个开关有牙）')
+  const rendered = renderLikeHost(def, text)
+  ok(rendered.includes('{{hexagon}}'), '17. 本实现（interpolate:false）不抛，且字面保留 {{hexagon}}')
 }
 
 console.log(`\nskill-gate 自检：${checks} 条断言全过（插件不注册任何工具、不注册任何守卫）`)
