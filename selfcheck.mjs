@@ -476,4 +476,46 @@ console.log('# 10. 宿主只读路由：不起浏览器也能验注册与返回�
   }
 }
 
+console.log('# 11. bash 写信号按**命令位置**判：参数位置不算写，藏在参数里的写也判不了')
+{
+  // 配了非空名单且本轮还没加载 ⇒ 下面的「放行」都是真判定结果，不是空名单放行。
+  const h = ctxOf({ config: { requiredSkills: ['a'] }, services: { skills: catalog('a') } })
+  const N = { id: 'agent-N' }
+  await h.step(N, 1)
+  const bash = (command) => h.guard({ name: 'bash', agent: N, arguments: { command } })
+  const allowed = (command, label) => ok(bash(command) === undefined, `11. 放行 ${label}：${command}`)
+  const blocked = (command, label) => ok(typeof bash(command) === 'string', `11. 拦下 ${label}：${command}`)
+
+  // 负向对照：这几个是旧的裸词判据（`\binstall\b` / `\bdd\b` / `\bpatch\b` / `\bsed\b`）误拦的读命令。
+  allowed('cat -n install.sh', 'install 只在参数位置')
+  allowed('grep -c dd file', 'dd 只在参数位置')
+  allowed('ls patch/', 'patch 只在参数位置')
+  allowed("sed -n '1,5p' a", 'sed 没带 -i')
+  allowed('rg -n "cp a b" README.md', '写命令词在引号里')
+  allowed('git log --grep add', 'git 子命令是 log，add 只是参数')
+
+  // 命令位置上的写命令；`git add` 与 `sort -o` 是旧判据漏拦的。
+  blocked('install -m 644 a b', 'install 在命令位置')
+  blocked('cp a b', 'cp')
+  blocked('dd if=/dev/zero of=x', 'dd')
+  blocked('git add x', 'git add（旧判据漏）')
+  blocked('sed -i s/a/b/ f', 'sed -i')
+  blocked('sort -o out in', 'sort -o（旧判据漏）')
+  blocked('sudo true', 'sudo')
+  blocked('cmd > out.txt', '非空汇输出重定向')
+  blocked('/usr/bin/rm -f x', '路径写法的命令词')
+  blocked('xargs rm -rf x', '包装命令后的命令词')
+
+  // 命令位置 = 行首或 `;` `|` `&&` `||` `$(` 等分隔符之后。
+  blocked('ls x; rm -rf /tmp/y', '分号后')
+  blocked('echo x | tee f', '管道后')
+  blocked('true && cp a b', '&& 后')
+  blocked('echo $(rm -rf /tmp/z)', '$( 里')
+  blocked('if test -f f; then rm f; fi', 'then 后')
+
+  // 已知边界（README「已知边界」写明的、故意不拦的）：写操作藏在参数或字符串里，判不了。
+  allowed('node -e "require(\'fs\').writeFileSync(\'x\',\'\')"', '已知边界：node -e 里的写判不了')
+  allowed("sh -c 'rm -rf /tmp/x'", '已知边界：sh -c 的字符串判不了')
+}
+
 console.log(`\nskill-gate 自检：${checks} 条断言全过（插件不注册任何工具）`)

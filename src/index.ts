@@ -37,31 +37,167 @@ export const Config = z.object({
 const GUARDED_TOOLS = new Set(['write', 'edit', 'plugin_manager'])
 
 /**
- * bash 的写操作信号。只拦明确会改东西的命令；ls / cat / rg / git status
- * 这类读命令一律放行，否则每个任务开头都会撞门禁。
+ * 会改状态的命令词。判据是**命令位置**：出现在行首、或 `;` `|` `&&` `||` `$(` 这类分隔符
+ * 之后的那个词。同一个词出现在参数位置不算 —— `cat -n install.sh`、`grep -c dd f`、
+ * `ls patch/` 都是纯读，否则每个任务开头都会撞门禁。
+ *
+ * 代价是判不了藏在参数里的写操作（`node -e '…writeFileSync…'`、`sh -c 'rm -rf x'`），
+ * 见 README「已知边界」。
  */
-const BASH_WRITE_SIGNAL = new RegExp(
-  [
-    '(^|[^<])>{1,2}(?!&)',
-    '\\btee\\b',
-    '\\brm\\b',
-    '\\bmv\\b',
-    '\\bcp\\b',
-    '\\bmkdir\\b',
-    '\\btouch\\b',
-    '\\btruncate\\b',
-    '\\bdd\\b',
-    '\\bchmod\\b',
-    '\\bchown\\b',
-    '\\bln\\b',
-    '\\bsed\\s+-i',
-    '\\bpatch\\b',
-    '\\binstall\\b',
-    '\\bgit\\s+(commit|push|reset|checkout|clean|rebase|merge|apply|stash|switch|restore|branch)\\b',
-    '\\b(systemctl|apt|apt-get|dpkg|pip|pipx|npm|pnpm|yarn|cargo|uv)\\s+(install|add|remove|uninstall|upgrade|update|publish|sync)\\b',
-    '\\bsudo\\b',
-  ].join('|'),
-)
+const WRITE_COMMANDS = new Set([
+  'tee',
+  'rm',
+  'mv',
+  'cp',
+  'mkdir',
+  'touch',
+  'truncate',
+  'dd',
+  'chmod',
+  'chown',
+  'ln',
+  'patch',
+  'install',
+  'sudo',
+])
+
+/** 带上这些开关才算写的命令：`sed -i` / `sort -o` 落盘，`sed -n` / `sort -k` 只读。 */
+const WRITE_FLAGS = new Map([
+  ['sed', /^(-i|--in-place)/],
+  ['sort', /^(-o|--output)/],
+])
+
+const GIT_WRITE_SUBCOMMANDS = new Set([
+  'add',
+  'commit',
+  'push',
+  'reset',
+  'checkout',
+  'clean',
+  'rebase',
+  'merge',
+  'apply',
+  'stash',
+  'switch',
+  'restore',
+  'branch',
+  'rm',
+  'mv',
+  'cherry-pick',
+  'revert',
+])
+
+const PACKAGE_MANAGERS = new Set([
+  'systemctl',
+  'apt',
+  'apt-get',
+  'dpkg',
+  'pip',
+  'pipx',
+  'npm',
+  'pnpm',
+  'yarn',
+  'cargo',
+  'uv',
+])
+
+const PACKAGE_WRITE_SUBCOMMANDS = new Set([
+  'install',
+  'add',
+  'remove',
+  'uninstall',
+  'upgrade',
+  'update',
+  'publish',
+  'sync',
+])
+
+/** 真的写文件的输出重定向；`2>&1` / `>&2` 只是换文件描述符，不算。 */
+const WRITE_REDIRECT = /(^|[^<])>{1,2}(?!&)/
+
+/** 命令位置的分隔符。`(` `)` 与反引号一起切开，`$(rm -rf x)` 里的命令词也落到段首。 */
+const COMMAND_SEPARATOR = /\|\||&&|[;|&\n(){}`]/
+
+/** 命令前的噪声：shell 关键字与本身不改状态的包装命令。 */
+const COMMAND_PREFIX = new Set([
+  'command',
+  'builtin',
+  'exec',
+  'nohup',
+  'time',
+  'env',
+  'xargs',
+  'then',
+  'do',
+  'else',
+  'if',
+  'while',
+  'until',
+  '!',
+])
+
+/** `VAR=value` 形式的行内环境变量。 */
+const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/
+
+/** 按命令位置切段：每段至少一个词。 */
+function commandSegments(command: string): string[][] {
+  const segments: string[][] = []
+  for (const part of command.split(COMMAND_SEPARATOR)) {
+    const tokens = part.trim().split(/\s+/).filter(Boolean)
+    if (tokens.length > 0) segments.push(tokens)
+  }
+  return segments
+}
+
+/**
+ * 段首的命令词：跳过 `VAR=value`、包装命令与开头的开关（命令词不会以 `-` 开头）。
+ * 路径写成 `/usr/bin/rm` 时取 basename；`\rm` 这种转义别名也要认出来。
+ */
+function commandWordOf(tokens: string[]): { word: string; args: string[] } | undefined {
+  let i = 0
+  while (
+    i < tokens.length &&
+    (ENV_ASSIGNMENT.test(tokens[i]) || COMMAND_PREFIX.has(tokens[i]) || tokens[i].startsWith('-'))
+  ) {
+    i++
+  }
+  if (i >= tokens.length) return undefined
+  const word = tokens[i].split('/').pop()!.replace(/^\\/, '')
+  return { word, args: tokens.slice(i + 1) }
+}
+
+/** 跳过 `git -C <dir>` 这类带值的开关，取子命令 —— 别把 `git log --grep add` 的 add 当成子命令。 */
+function gitSubcommand(args: string[]): string | undefined {
+  let i = 0
+  while (i < args.length && args[i].startsWith('-')) {
+    i += args[i] === '-C' || args[i] === '-c' ? 2 : 1
+  }
+  return args[i]
+}
+
+function firstNonFlag(args: string[]): string | undefined {
+  return args.find((token) => !token.startsWith('-'))
+}
+
+/**
+ * bash 命令是否改状态。先抹掉空汇重定向（`/dev/null` 不改变状态），
+ * 再看有没有非空汇重定向、或命令位置上的写命令词。
+ */
+function bashLooksLikeWrite(command: string): boolean {
+  const text = command.replace(NULL_SINK, ' ')
+  if (WRITE_REDIRECT.test(text)) return true
+  for (const tokens of commandSegments(text)) {
+    const parsed = commandWordOf(tokens)
+    if (!parsed) continue
+    const { word, args } = parsed
+    if (WRITE_COMMANDS.has(word)) return true
+    if (word === 'git' && GIT_WRITE_SUBCOMMANDS.has(gitSubcommand(args) ?? '')) return true
+    if (PACKAGE_MANAGERS.has(word) && PACKAGE_WRITE_SUBCOMMANDS.has(firstNonFlag(args) ?? '')) return true
+    const flag = WRITE_FLAGS.get(word)
+    if (flag && args.some((token) => flag.test(token))) return true
+  }
+  return false
+}
 
 /** agentId -> 本轮成功加载过的 skill 名。 */
 const loadedSkills = new Map()
@@ -83,7 +219,7 @@ function isGuarded(exec) {
   if (exec.name !== 'bash') return false
   const command = exec.arguments?.command
   if (typeof command !== 'string') return false
-  return BASH_WRITE_SIGNAL.test(command.replace(NULL_SINK, ' '))
+  return bashLooksLikeWrite(command)
 }
 
 /** 配置里可能存着一个 volatile 引用（`{ get() }`），也可能就是普通数组。 */
