@@ -39,6 +39,10 @@ dsh plugin --profile <profile> add "file:$DSH_HOME/packages/dsh-skill-gate-<vers
 - 宿主半边另有一条只读路由 `GET /dsh-skill-gate/skill-index`（`src/index.ts` 的 `installClientRoute`）：
   `ctx.inject(['webServer'], …)` 拿可选服务，拿不到（非 web profile）就静默跳过；拿不到 `connection`
   时 fail-closed 不服务。载荷只有 skill 名字与截断后的描述，**不含路径、不含正文**。
+  **列 catalog 必须带 agent scope**（`skills.list({ cwd, signal, scope })`，与原生 `skill` 工具同形）：
+  agent 按 `?session=` → `agents.get` → `roots()[0]` → `list()[0]` → `currentInitiator()` 解析；
+  选不到就退回 `list({})`，并在载荷里标 `scope: 'global'` + `partial: true` + `reason`（客户端据此显示警示）。
+  不带 scope 会漏掉挂在 agent 层的文件型 provider（用户级/项目级 skill），只剩全局层那几份。
   路由行为由 `selfcheck.mjs` 第 10 节用假 webServer 钉住（不起浏览器也能验）。
 - 配置区注册在 `plugins.bundle.config`（key = 包名）与 `plugins.row.config`（key = `<包名>#<行 id>`）
   两处；保存/丢弃语义走官方 `SettingsFormModel` + `SettingsForm`，不要自己实现写回。

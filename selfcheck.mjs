@@ -386,6 +386,94 @@ console.log('# 10. 宿主只读路由：不起浏览器也能验注册与返回�
     badWebThrew = e
   }
   ok(badWebThrew === null, '10. webServer 形状不对时静默跳过，不抛')
+
+  // ── agent scope：列 catalog 必须与原生 `skill` 工具同一视角 ──────────────
+  // 文件型 provider 挂在按 agent 的 scope 层；不带 scope 就只剩全局层那几份。
+  const agentA = { id: 'agent-A' }
+  const agentB = { id: 'agent-B' }
+  const ensuredCwd = '/tmp/workspace-probe'
+
+  /** 记录 skills.list 的入参，其余用假 agents / workingDirectory 喂。 */
+  function scopedCtx(opts) {
+    const calls = []
+    const services = {
+      connection: { requestRejection: () => undefined },
+      skills: {
+        list: async (options) => {
+          calls.push(options)
+          return [{ name: 'only-one', description: '' }]
+        },
+      },
+    }
+    if (opts.agents !== undefined) services.agents = opts.agents
+    if (opts.workingDirectory !== undefined) services.workingDirectory = opts.workingDirectory
+    const h = ctxOf({ config: { requiredSkills: [] }, services })
+    return { h, calls }
+  }
+
+  // 有 agent：scope 就是它，cwd 来自 workingDirectory.ensure，载荷标 scope:'agent'。
+  {
+    const { h, calls } = scopedCtx({
+      agents: { roots: () => [agentA], list: () => [agentA], currentInitiator: () => agentA },
+      workingDirectory: { ensure: async (agent) => (agent === agentA ? ensuredCwd : undefined) },
+    })
+    const res = fakeRes()
+    await mountRoutes(h).routes[0].handler({ method: 'GET', url: '/dsh-skill-gate/skill-index' }, res)
+    const body = JSON.parse(res.body)
+    ok(calls.length === 1 && calls[0].scope === agentA, '10. 有 agent 时把它原样作为 scope 传给 skills.list')
+    ok(calls[0].cwd === ensuredCwd, '10. cwd 来自 workingDirectory.ensure(agent)')
+    ok(body.scope === 'agent' && body.partial === undefined, "10. 正常路径载荷 scope='agent' 且不标 partial")
+  }
+
+  // ?session= 命中：用它指定的 agent，而不是 roots()[0]。
+  {
+    const { h, calls } = scopedCtx({
+      agents: {
+        get: (id) => (id === 'session-target' ? agentA : undefined),
+        roots: () => [agentB],
+        list: () => [agentB],
+        currentInitiator: () => agentB,
+      },
+      workingDirectory: { ensure: async () => ensuredCwd },
+    })
+    await mountRoutes(h).routes[0].handler(
+      { method: 'GET', url: '/dsh-skill-gate/skill-index?session=session-target' }, fakeRes())
+    ok(calls[0].scope === agentA, '10. ?session= 命中时用它指定的 agent 当 scope')
+  }
+
+  // ?session= 未命中：退回 roots()[0]。
+  {
+    const { h, calls } = scopedCtx({
+      agents: { get: () => undefined, roots: () => [agentA], list: () => [agentB], currentInitiator: () => agentB },
+      workingDirectory: { ensure: async () => undefined },
+    })
+    await mountRoutes(h).routes[0].handler(
+      { method: 'GET', url: '/dsh-skill-gate/skill-index?session=missing' }, fakeRes())
+    ok(calls[0].scope === agentA, '10. ?session= 未命中时退回 roots()[0]')
+  }
+
+  // roots/list 都空：退回 currentInitiator()。
+  {
+    const { h, calls } = scopedCtx({
+      agents: { get: () => undefined, roots: () => [], list: () => [], currentInitiator: () => agentA },
+      workingDirectory: { ensure: async () => undefined },
+    })
+    await mountRoutes(h).routes[0].handler({ method: 'GET', url: '/dsh-skill-gate/skill-index' }, fakeRes())
+    ok(calls[0].scope === agentA, '10. roots/list 都空时退回 currentInitiator()')
+  }
+
+  // 没有 agents 服务：退回 list({})，并在载荷里标 partial + reason。
+  {
+    const { h, calls } = scopedCtx({})
+    const res = fakeRes()
+    await mountRoutes(h).routes[0].handler(
+      { method: 'GET', url: '/dsh-skill-gate/skill-index?session=whatever' }, res)
+    const body = JSON.parse(res.body)
+    ok(calls.length === 1 && Object.keys(calls[0]).length === 0, '10. 没有 agents 服务时退回 list({})：入参是空对象')
+    ok(body.partial === true && typeof body.reason === 'string' && body.reason !== '',
+      '10. 退化路径标 partial:true + 非空 reason')
+    ok(body.scope === 'global', "10. 退化路径 scope='global'")
+  }
 }
 
 console.log(`\nskill-gate 自检：${checks} 条断言全过（插件不注册任何工具）`)

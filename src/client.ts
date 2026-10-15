@@ -193,6 +193,23 @@
       }
 
       /**
+       * 当前会话 id：**可选**服务 + 可选能力，拿不到就 null。
+       * 拿不到时不要报错也不要传空串 —— 交给宿主自己按 roots/list/currentInitiator 挑 agent。
+       */
+      function currentSessionId(): string | null {
+        try {
+          const sessions = ctx.get('sessions')
+          const snapshot = sessions && sessions.list && typeof sessions.list.getSnapshot === 'function'
+            ? sessions.list.getSnapshot()
+            : null
+          const id = snapshot ? snapshot.current : null
+          return typeof id === 'string' && id.length > 0 ? id : null
+        } catch (e) {
+          return null
+        }
+      }
+
+      /**
        * 卡片正文。
        *
        * 勾选态**派生**自字段草稿文本，不另存一份局部状态 —— 于是「用户点了复选框」与
@@ -203,8 +220,16 @@
         const [catalog, setCatalog] = React.useState({
           status: 'loading',
           skills: [],
-          error: null
-        } as { status: 'loading' | 'ready' | 'error'; skills: Array<{ name: string; description: string }>; error: string | null })
+          error: null,
+          partial: false,
+          reason: null
+        } as {
+          status: 'loading' | 'ready' | 'error'
+          skills: Array<{ name: string; description: string }>
+          error: string | null
+          partial: boolean
+          reason: string | null
+        })
         const [filter, setFilter] = React.useState('')
         const [notice, setNotice] = React.useState(null as string | null)
         // 只有「从脏变干净、且不是因为失败」才算一次落地的保存，避免首屏就显示「已保存」。
@@ -215,7 +240,12 @@
           let live = true
           const load = async () => {
             try {
-              const response = await fetch(SKILL_ROUTE, { headers: { accept: 'application/json' } })
+              // 带上当前会话 id，宿主就能拿它当 agent scope；拿不到就不带，宿主自己挑。
+              const sessionId = currentSessionId()
+              const url = sessionId === null
+                ? SKILL_ROUTE
+                : SKILL_ROUTE + '?session=' + encodeURIComponent(sessionId)
+              const response = await fetch(url, { headers: { accept: 'application/json' } })
               const payload: any = await response.json().catch(() => null)
               if (!response.ok) throw new Error((payload && payload.error) || 'HTTP ' + response.status)
               if (!payload || !Array.isArray(payload.skills)) throw new Error('返回的形状不是 { skills: [...] }')
@@ -227,14 +257,22 @@
                   description: typeof item.description === 'string' ? item.description : ''
                 }))
                 .sort((a: any, b: any) => a.name.localeCompare(b.name))
-              setCatalog({ status: 'ready', skills: items, error: null })
+              setCatalog({
+                status: 'ready',
+                skills: items,
+                error: null,
+                partial: payload.partial === true,
+                reason: typeof payload.reason === 'string' && payload.reason !== '' ? payload.reason : null
+              })
             } catch (error) {
               if (!live) return
               // 读不到就退回文本框：说明为什么退化，绝不白屏。
               setCatalog({
                 status: 'error',
                 skills: [],
-                error: (error && error.message) || '无法读取 skill 列表'
+                error: (error && error.message) || '无法读取 skill 列表',
+                partial: false,
+                reason: null
               })
             }
           }
@@ -314,6 +352,10 @@
           { style: styles.page, key: 'checklist' },
           h('label', { style: styles.label }, '必读 skill 名单'),
           h('p', { style: styles.hint }, '勾上本轮必须成功加载的 skill。一个都不勾 = 名单为空 = 门禁不生效。'),
+          catalog.partial
+            ? h('p', { style: styles.failed, role: 'status' },
+                catalog.reason || '只列出全局层：当前没有可用的会话，项目级/用户级 skill 可能不在列表里。')
+            : null,
           catalog.status === 'loading'
             ? h('p', { style: styles.hint, role: 'status' }, '正在读取 skill 列表…')
             : null,

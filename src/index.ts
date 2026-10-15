@@ -197,11 +197,67 @@ function denyMissing(toolName, missing) {
 }
 
 /**
+ * 从 `req.url` 里取 `?session=<id>`：没有查询串、参数为空、解析失败都返回 undefined。
+ */
+function sessionIdFromUrl(url: unknown): string | undefined {
+  if (typeof url !== 'string') return undefined
+  const at = url.indexOf('?')
+  if (at === -1) return undefined
+  try {
+    const value = new URLSearchParams(url.slice(at + 1)).get('session')
+    return typeof value === 'string' && value !== '' ? value : undefined
+  } catch (e) {
+    return undefined
+  }
+}
+
+/**
+ * 挑一个 agent 当 scope，优先级：`?session=` 指定的 → `roots()[0]` → `list()[0]` → `currentInitiator()`。
+ * `agents` 是**可选**服务：缺席或调用抛错都返回 undefined，由调用方退回全局层并标 partial。
+ */
+function resolveAgent(ctx, sessionId: string | undefined) {
+  let agents
+  try {
+    agents = ctx.get('agents')
+  } catch (e) {
+    return undefined
+  }
+  if (!agents) return undefined
+  try {
+    if (sessionId !== undefined && typeof agents.get === 'function') {
+      const bySession = agents.get(sessionId)
+      if (bySession) return bySession
+    }
+    if (typeof agents.roots === 'function') {
+      const roots = agents.roots()
+      if (Array.isArray(roots) && roots.length > 0) return roots[0]
+    }
+    if (typeof agents.list === 'function') {
+      const list = agents.list()
+      if (Array.isArray(list) && list.length > 0) return list[0]
+    }
+    if (typeof agents.currentInitiator === 'function') {
+      const initiator = agents.currentInitiator()
+      if (initiator) return initiator
+    }
+  } catch (e) {
+    return undefined
+  }
+  return undefined
+}
+
+/**
  * 浏览器读 catalog 的只读路由（`GET /dsh-skill-gate/skill-index`）。
  *
  * 形状照 dsh 生态里同类的只读 loopback 路由：`ctx.inject(['webServer'], …)` 拿可选服务，
  * `webServer.register({ kind: 'exact', path, handler })` 挂上去，返回的 disposer 交给 `effect`；
  * 拿不到 `connection` 时 fail-closed 不服务。
+ *
+ * **列 catalog 的视角必须与原生 `skill` 工具一致**：文件型 provider（`~/.dsh/skills`、项目级）
+ * 挂在**按 agent 的 scope 层**里，`skills.list({})` 只会看到全局层（插件运行时注册的那几份）。
+ * 所以这里 `?session=` → `agents.get` / `roots()[0]` / `list()[0]` / `currentInitiator()` 选一个
+ * agent 当 `scope`，cwd 走 `workingDirectory.ensure`；选不到 agent 才退回 `list({})`，并在载荷里
+ * 标 `partial: true` + `reason`，让客户端显示警示而不是假装列表是全的。
  *
  * `webServer` 是**可选**服务：非 web profile（没有 web server）时整段静默跳过，宿主半边绝不
  * 因此报错。载荷只有名字与截断后的描述，不含路径、不含正文。
@@ -245,10 +301,24 @@ function installClientRoute(ctx) {
             sendJson(res, 503, { error: '这个部署没有可用的 skills 服务，无法列出 catalog' })
             return
           }
+
+          // 与原生 `skill` 工具同一个视角：agent 直接当 scope 传（文件型 provider 挂在这一层），
+          // 不带 scope 就只剩全局层。选不到 agent 才退回全局层，并把这件事标进载荷。
+          const agent = resolveAgent(ctx, sessionIdFromUrl(req.url))
+          const lookup: any = { cwd: undefined, signal: undefined, scope: agent }
+          if (agent) {
+            try {
+              const workingDirectory = ctx.get('workingDirectory')
+              if (workingDirectory && typeof workingDirectory.ensure === 'function') {
+                lookup.cwd = await workingDirectory.ensure(agent, undefined)
+              }
+            } catch (e) {
+              lookup.cwd = undefined
+            }
+          }
           let list
           try {
-            // 不带 cwd 列一次：列的是**不带项目上下文的 catalog**，项目级 skill 可能不在里面。
-            list = await skills.list({})
+            list = await (agent ? skills.list(lookup) : skills.list({}))
           } catch (e) {
             sendJson(res, 502, { error: '读取 catalog 失败：' + String((e && e.message) || e) })
             return
@@ -257,7 +327,13 @@ function installClientRoute(ctx) {
             sendJson(res, 502, { error: 'catalog 返回的不是列表' })
             return
           }
-          sendJson(res, 200, buildSkillIndex(list))
+          const payload: any = buildSkillIndex(list)
+          payload.scope = agent ? 'agent' : 'global'
+          if (!agent) {
+            payload.partial = true
+            payload.reason = '只列出全局层：当前没有可用的会话，项目级/用户级 skill 可能不在列表里'
+          }
+          sendJson(res, 200, payload)
         }
       }), `dsh-skill-gate: GET ${SKILL_INDEX_ROUTE}`)
     } catch (e) {}
