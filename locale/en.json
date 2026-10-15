@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Skill Gate",
+    "description": "Refuses state-changing tool calls until the session has loaded the required skills."
+  }
+}

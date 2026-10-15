@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Skill 门禁",
+    "description": "在会话成功加载所需的 skill 之前，拒绝会改变状态的工具调用。"
+  }
+}
